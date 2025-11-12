@@ -41,7 +41,8 @@ def lambda_handler(event, context):
         print(f"Loading traffic data for {year}-{month_str}")
         print(f"Date range: {start_date} to {end_date}")
 
-        # Fetch data from API (get all records, will filter by date)
+        # Fetch data from API (get limited records to avoid memory issues)
+        # For one month, 20k records should be enough
         url = f"{API_ENDPOINT}?resource_id={RESOURCE_ID}&limit=20000"
         print(f"Fetching from API: {url}")
 
@@ -74,35 +75,54 @@ def lambda_handler(event, context):
                 })
             }
 
+        # Group records by day
+        records_by_day = {}
+        for record in filtered_records:
+            record_date = record.get('MessungDatZeit', '')[:10]  # YYYY-MM-DD
+            if record_date not in records_by_day:
+                records_by_day[record_date] = []
+            records_by_day[record_date].append(record)
+
+        print(f"Grouped into {len(records_by_day)} days")
+
         # Get current timestamp for filename
         now = datetime.utcnow()
-        day = str(now.day).zfill(2)
         hour = str(now.hour).zfill(2)
         minute = str(now.minute).zfill(2)
         timestamp = now.isoformat()
 
-        # Save to S3: traffic/2025/01/12_0916_zurich_traffic_2025-01.json
-        filename = f"{day}_{hour}{minute}_zurich_traffic_{year}-{month_str}_{timestamp.replace(':', '-')}.json"
-        s3_key = f"traffic/{year}/{month_str}/{filename}"
+        # Save each day's data to a separate file
+        uploaded_count = 0
+        for day_date, day_records in sorted(records_by_day.items()):
+            day_part = day_date.split('-')[2]  # Extract day from YYYY-MM-DD
 
-        # Prepare data for S3
-        output_data = {
-            'fetch_timestamp': timestamp,
-            'year': year,
-            'month': month,
-            'records_fetched': total_in_range,
-            'data': filtered_records
-        }
+            # Save to S3: traffic/2025/01/01/zurich_traffic_2025-01-01_0916.json
+            filename = f"zurich_traffic_{day_date}_{hour}{minute}.json"
+            s3_key = f"traffic/{year}/{month_str}/{filename}"
 
-        # Upload to S3
-        s3_client.put_object(
-            Bucket=BUCKET_NAME,
-            Key=s3_key,
-            Body=json.dumps(output_data, indent=2),
-            ContentType='application/json'
-        )
+            # Prepare data for S3
+            output_data = {
+                'fetch_timestamp': timestamp,
+                'year': year,
+                'month': month,
+                'day': int(day_part),
+                'date': day_date,
+                'records_fetched': len(day_records),
+                'data': day_records
+            }
 
-        print(f"✅ Saved {total_in_range} records to s3://{BUCKET_NAME}/{s3_key}")
+            # Upload to S3
+            s3_client.put_object(
+                Bucket=BUCKET_NAME,
+                Key=s3_key,
+                Body=json.dumps(output_data, indent=2),
+                ContentType='application/json'
+            )
+
+            uploaded_count += len(day_records)
+            print(f"  ✅ Day {day_date}: {len(day_records)} records → {s3_key}")
+
+        print(f"✅ Successfully saved {uploaded_count} records across {len(records_by_day)} days")
 
         return {
             'statusCode': 200,
@@ -110,8 +130,9 @@ def lambda_handler(event, context):
                 'message': 'Success',
                 'year': year,
                 'month': month,
-                'records_fetched': total_in_range,
-                's3_location': f"s3://{BUCKET_NAME}/{s3_key}"
+                'total_records_fetched': total_in_range,
+                'days_with_data': len(records_by_day),
+                's3_base_location': f"s3://{BUCKET_NAME}/traffic/{year}/{month_str}/"
             })
         }
 
