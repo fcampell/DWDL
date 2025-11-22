@@ -1,0 +1,125 @@
+import json
+import urllib.request
+import boto3
+import csv
+from io import StringIO
+from datetime import datetime
+
+s3_client = boto3.client('s3')
+
+def lambda_handler(event, context):
+    """
+    Load all 4 small VBZ reference tables in one execution
+
+    Tables:
+    1. HALTESTELLEN - Stop information (~800 records)
+    2. LINIE - Line/route information (~108 records)
+    3. TAGTYP - Day type definitions (~26 records)
+    4. GEFAESSGROESSE - Vehicle capacity specs (~42k records)
+
+    Takes ~1 minute total
+    """
+
+    BUCKET_NAME = "facade-project-academy-20251122-143025"
+    BASE_URL = "https://data.stadt-zuerich.ch/dataset/vbz_fahrgastzahlen_ogd/download"
+
+    timestamp = datetime.utcnow().isoformat()
+    year = 2025
+
+    small_tables = {
+        'HALTESTELLEN': f"{BASE_URL}/HALTESTELLEN.csv",
+        'LINIE': f"{BASE_URL}/LINIE.csv",
+        'TAGTYP': f"{BASE_URL}/TAGTYP.csv",
+        'GEFAESSGROESSE': f"{BASE_URL}/GEFAESSGROESSE.csv"
+    }
+
+    results = {}
+
+    try:
+        print("=" * 80)
+        print("📥 Loading all 4 small VBZ reference tables...")
+        print("=" * 80)
+        print(f"Bucket: {BUCKET_NAME}")
+        print(f"Timestamp: {timestamp}")
+        print()
+
+        for table_name, url in small_tables.items():
+            try:
+                print(f"  {table_name}...", end=' ', flush=True)
+
+                with urllib.request.urlopen(url, timeout=60) as response:
+                    csv_data = response.read().decode('utf-8')
+
+                csv_reader = csv.DictReader(StringIO(csv_data), delimiter=';')
+                records = list(csv_reader)
+                record_count = len(records)
+
+                print(f"✅ {record_count} records")
+
+                # Prepare data
+                output_data = {
+                    'fetch_timestamp': timestamp,
+                    'year': year,
+                    'table_name': table_name,
+                    'record_count': record_count,
+                    'data': records
+                }
+
+                # Save to S3
+                #s3_key = f"bronze/vbz/{table_name.lower()}.json"
+                s3_key = f"bronze/vbz/{table_name.lower()}.csv"
+
+                #s3_client.put_object(
+                #    Bucket=BUCKET_NAME,
+                #    Key=s3_key,
+                #    Body=json.dumps(output_data, indent=2, ensure_ascii=False),
+                #    ContentType='application/json')
+                s3_client.put_object(
+                    Bucket=BUCKET_NAME,
+                    Key=s3_key,
+                    Body=csv_data,
+                    ContentType='text/csv'
+                )
+
+                results[table_name] = {
+                    'status': 'success',
+                    'records': record_count,
+                    's3_location': f"s3://{BUCKET_NAME}/{s3_key}"
+                }
+
+            except Exception as e:
+                print(f"❌ Error: {str(e)}")
+                results[table_name] = {'status': 'failed', 'error': str(e)}
+
+        print()
+        print("=" * 80)
+        print("✅ ALL SMALL TABLES LOADED SUCCESSFULLY")
+        print("=" * 80)
+        print()
+
+        successful = sum(1 for v in results.values() if v['status'] == 'success')
+        total = len(results)
+
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': f'✅ {successful}/{total} tables loaded successfully',
+                'tables_loaded': successful,
+                'timestamp': timestamp,
+                'results': results,
+                's3_base_location': f"s3://{BUCKET_NAME}/bronze/vbz/"
+            }, ensure_ascii=False)
+        }
+
+    except Exception as e:
+        print(f"❌ Fatal error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'error': f'Failed: {str(e)}',
+                'timestamp': timestamp
+            }, ensure_ascii=False)
+        }
