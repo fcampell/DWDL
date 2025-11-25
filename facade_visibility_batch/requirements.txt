@@ -1,0 +1,7 @@
+geopandas
+pyarrow
+# shapely
+# pyproj
+# rtree
+# networkx
+# boto3
