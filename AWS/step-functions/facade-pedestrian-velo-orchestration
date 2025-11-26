@@ -1,0 +1,180 @@
+{
+  "Comment": "Fetch pedestrian/velo data for all 12 months of 2025 in parallel",
+  "StartAt": "FetchAllMonths",
+  "States": {
+    "FetchAllMonths": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "January",
+          "States": {
+            "January": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:us-east-1:273605903090:function:facade-pedestrian-velo:$LATEST",
+              "Parameters": {
+                "year": 2025,
+                "month": 1
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "February",
+          "States": {
+            "February": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:us-east-1:273605903090:function:facade-pedestrian-velo:$LATEST",
+              "Parameters": {
+                "year": 2025,
+                "month": 2
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "March",
+          "States": {
+            "March": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:us-east-1:273605903090:function:facade-pedestrian-velo:$LATEST",
+              "Parameters": {
+                "year": 2025,
+                "month": 3
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "April",
+          "States": {
+            "April": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:us-east-1:273605903090:function:facade-pedestrian-velo:$LATEST",
+              "Parameters": {
+                "year": 2025,
+                "month": 4
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "May",
+          "States": {
+            "May": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:us-east-1:273605903090:function:facade-pedestrian-velo:$LATEST",
+              "Parameters": {
+                "year": 2025,
+                "month": 5
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "June",
+          "States": {
+            "June": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:us-east-1:273605903090:function:facade-pedestrian-velo:$LATEST",
+              "Parameters": {
+                "year": 2025,
+                "month": 6
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "July",
+          "States": {
+            "July": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:us-east-1:273605903090:function:facade-pedestrian-velo:$LATEST",
+              "Parameters": {
+                "year": 2025,
+                "month": 7
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "August",
+          "States": {
+            "August": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:us-east-1:273605903090:function:facade-pedestrian-velo:$LATEST",
+              "Parameters": {
+                "year": 2025,
+                "month": 8
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "September",
+          "States": {
+            "September": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:us-east-1:273605903090:function:facade-pedestrian-velo:$LATEST",
+              "Parameters": {
+                "year": 2025,
+                "month": 9
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "October",
+          "States": {
+            "October": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:us-east-1:273605903090:function:facade-pedestrian-velo:$LATEST",
+              "Parameters": {
+                "year": 2025,
+                "month": 10
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "November",
+          "States": {
+            "November": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:us-east-1:273605903090:function:facade-pedestrian-velo:$LATEST",
+              "Parameters": {
+                "year": 2025,
+                "month": 11
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "December",
+          "States": {
+            "December": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:us-east-1:273605903090:function:facade-pedestrian-velo:$LATEST",
+              "Parameters": {
+                "year": 2025,
+                "month": 12
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "End": true
+    }
+  }
+}
