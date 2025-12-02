@@ -1,0 +1,22 @@
+# Core geospatial stack
+geopandas==0.14.3
+shapely==2.0.2
+pyproj==3.6.1
+rtree==1.2.0
+
+# OSM / routing
+scipy==1.13.1
+osmnx==1.9.1
+networkx==3.2.1
+
+# I/O and utilities
+pandas==2.2.2
+requests==2.32.3
+boto3==1.34.131
+
+# Needed for contextily tiler CRS operations (internally uses rasterio)
+#contextily==1.4.0
+
+# Parquet support (if OUTPUT_FORMAT = parquet)
+pyarrow==15.0.2
+
