@@ -1,60 +1,82 @@
 #!/usr/bin/env python
 """
-Pedestrian & cyclist flow simulation for Zürich – from counting stations to edge flows.
+Pedestrian & cyclist flow simulation for Zürich – from counting stations to edge-time flows.
 
-This script is a batch version of your notebook:
-- Loads daily values for pedestrians & cyclists
-- Aggregates mean daily flows per station
-- Builds station GeoDataFrames (LV95 → WGS84)
-- Builds separate OSMnx networks for bike & walk
-- Snaps stations to nearest edges
-- Propagates flows along the networks with distance decay & comfort/direction weights
-- Aggregates flows per edge for bike and pedestrian networks
-- Writes two output files (bike edges + ped edges) in EPSG:2056
+Changes vs previous version:
+- Input can be a *folder/prefix* containing many Parquet files.
+- Only files whose filenames contain a given substring (e.g. "pedestrian")
+  are read and concatenated before processing.
+- Still keeps all observations (hourly), models flows per timestamp.
+- **Outputs are now only normalized forms**:
+  - geometries (one row per edge) in GeoPackage + GeoParquet
+  - flows (edge × time) in plain Parquet.
 
+--------------------------------------------------
 Environment variables
----------------------
+--------------------------------------------------
 
 I/O mode (local vs S3)
 ~~~~~~~~~~~~~~~~~~~~~~
 If all of these are set, we run in S3 mode:
-- INPUT_BUCKET      : S3 bucket for input CSV
-- INPUT_KEY         : S3 key for input CSV
-- OUTPUT_BUCKET     : S3 bucket for output files (prefix)
-- OUTPUT_KEY        : "base" path for outputs, e.g. "silver/zurich_pedbike_flows.gpkg"
+- INPUT_BUCKET          : S3 bucket for input Parquet files
+- OUTPUT_BUCKET         : S3 bucket for outputs
+
+You can then choose between:
+  Single-file mode:
+    - INPUT_KEY         : S3 key for one Parquet file
+
+  Multi-file mode:
+    - INPUT_PREFIX      : S3 prefix (i.e. "folder") with many Parquet files
+    - INPUT_FILENAME_SUBSTR (optional) : substring that must be in filename
+                                         (default: "pedestrian")
 
 Otherwise, we run in local mode:
-- LOCAL_BUCKET_ROOT : root folder inside container (default: "/data")
-- INPUT_KEY         : path to CSV relative to LOCAL_BUCKET_ROOT
-                      e.g. "bronze/2025_verkehrszaehlungen_werte_fussgaenger_velo.csv"
-- OUTPUT_KEY        : base path for outputs relative to LOCAL_BUCKET_ROOT
-                      e.g. "silver/zurich_pedbike_flows.gpkg"
+- LOCAL_BUCKET_ROOT     : root folder inside container (default: "/data")
 
-The script then writes:
-- <base>_bike.<ext>  (bike flows per edge)
-- <base>_ped.<ext>   (ped flows per edge)
+Input choice:
+  Single-file mode:
+    - INPUT_KEY         : Parquet file relative to LOCAL_BUCKET_ROOT
+
+  Multi-file mode:
+    - INPUT_DIR         : folder relative to LOCAL_BUCKET_ROOT with many Parquet files
+    - INPUT_FILENAME_SUBSTR (optional) : substring that must be in filename
+                                         (default: "pedestrian")
+
+If neither INPUT_DIR/INPUT_PREFIX nor INPUT_KEY is set, we fall back to:
+- PEDESTRIAN_VELO_PARQUET_FILE (default: "2025_verkehrszaehlungen_werte_fussgaenger_velo.parquet")
+
+Outputs
+~~~~~~~
+Per mode (bike & pedestrian) we now write **only normalized outputs**:
+
+Bike:
+  1) Normalized edges (GeoPackage, geometries only, one row per edge, CRS=EPSG:2056):
+       - <base>_bike_edges.gpkg    (S3) or bike_edges.gpkg (local)
+  2) Normalized edges (GeoParquet, geometries only, one row per edge, CRS=EPSG:2056):
+       - <base>_bike_edges.parquet or bike_edges.parquet
+  3) Normalized flows (Parquet, non-geo, edge × time):
+       - <base>_bike_flows.parquet or bike_flows.parquet
+
+Pedestrian: analogous with "ped_" names.
+
+Output base:
+- S3  : OUTPUT_PREFIX (e.g. "silver/zurich_pedbike_flows")
+- Local: OUTPUT_DIR under LOCAL_BUCKET_ROOT (e.g. "silver/zurich_pedbike_flows")
 
 Other config
 ~~~~~~~~~~~~
-- OUTPUT_FORMAT     : "gpkg" (default) or "parquet"
 - LOG_LEVEL         : "INFO" (default), "DEBUG", ...
-- PEDESTRIAN_VELO_CSV_FILE : default input file name if INPUT_KEY is not set
-                              (default: "2025_verkehrszaehlungen_werte_fussgaenger_velo.csv")
+- OSM_PLACE         : place name for OSMnx (default: "Zürich, Switzerland")
+- INPUT_FILENAME_SUBSTR : default "pedestrian"
 
-OSM / model parameters (hard-coded for now, can be env-ified later)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-- place_name        : "Zürich, Switzerland"
-- BIKE_MODEL_PARAMS
-- PED_MODEL_PARAMS
-
-Typical local run
------------------
+Example – local, multi-file input
+---------------------------------
 docker run --rm \
   -v "$(pwd)/local_bucket:/data" \
   -e LOCAL_BUCKET_ROOT=/data \
-  -e INPUT_KEY="bronze/2025_verkehrszaehlungen_werte_fussgaenger_velo.csv" \
-  -e OUTPUT_KEY="silver/zurich_pedbike_flows.gpkg" \
-  -e OUTPUT_FORMAT="gpkg" \
+  -e INPUT_DIR="bronze/pedbike_counts_2025" \
+  -e INPUT_FILENAME_SUBSTR="pedestrian" \
+  -e OUTPUT_DIR="silver/zurich_pedbike_flows" \
   pedbike-flows:latest
 """
 
@@ -68,8 +90,8 @@ import boto3
 import numpy as np
 import pandas as pd
 import geopandas as gpd
+from pandas.api.types import is_object_dtype
 from shapely.geometry import Point
-from pyproj import Transformer
 import osmnx as ox
 import networkx as nx
 
@@ -81,6 +103,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
+
 
 # -------------------------------------------------------------------
 # Env helpers
@@ -105,6 +128,7 @@ def get_env_float(name: str, default: float) -> float:
     except ValueError:
         logger.warning("Invalid float for %s=%r, using default %f", name, v, default)
         return default
+
 
 # -------------------------------------------------------------------
 # Generic helpers
@@ -151,89 +175,184 @@ def distance_decay(flow_value, distance_m, alpha):
         return float(flow_value)
     return float(flow_value * np.exp(-alpha * distance_m))
 
+
+def coerce_object_to_string_for_parquet(df: pd.DataFrame, geometry_col: str | None = None):
+    """
+    Convert all object columns (except geometry) to string before writing to Parquet.
+    Safe for plain DataFrames (flows tables).
+    """
+    df = df.copy()
+    for col in df.columns:
+        if geometry_col is not None and col == geometry_col:
+            continue
+        if is_object_dtype(df[col]):
+            df[col] = df[col].astype("string")
+    return df
+
+
+def prepare_gdf_for_parquet(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    For GeoParquet: keep GeoDataFrame (to preserve geometry metadata),
+    but coerce all non-geometry object columns to string.
+    """
+    gdf = gdf.copy()
+    geom_col = gdf.geometry.name
+    for col in gdf.columns:
+        if col == geom_col:
+            continue
+        if is_object_dtype(gdf[col]):
+            gdf[col] = gdf[col].astype("string")
+    return gdf
+
+
+def save_gdf_local(gdf: gpd.GeoDataFrame, path: str, as_gpkg: bool):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if as_gpkg:
+        logger.info("Writing local GPKG: %s", path)
+        gdf.to_file(path, driver="GPKG")
+    else:
+        logger.info("Writing local GeoParquet: %s", path)
+        gdf_to_write = prepare_gdf_for_parquet(gdf)
+        gdf_to_write.to_parquet(path, index=False)
+
+
+def save_gdf_s3(
+    gdf: gpd.GeoDataFrame,
+    bucket: str,
+    key: str,
+    as_gpkg: bool,
+):
+    s3 = boto3.client("s3")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        if as_gpkg:
+            tmp_name = "tmp_output.gpkg"
+            tmp_path = os.path.join(tmpdir, tmp_name)
+            gdf.to_file(tmp_path, driver="GPKG")
+        else:
+            tmp_name = "tmp_output.parquet"
+            tmp_path = os.path.join(tmpdir, tmp_name)
+            gdf_to_write = prepare_gdf_for_parquet(gdf)
+            gdf_to_write.to_parquet(tmp_path, index=False)
+
+        size_bytes = os.path.getsize(tmp_path)
+        logger.info("Temporary output %s (size=%d bytes)", tmp_path, size_bytes)
+        logger.info("Uploading to s3://%s/%s", bucket, key)
+        s3.upload_file(tmp_path, bucket, key)
+
+
 # -------------------------------------------------------------------
-# I/O helpers (same conventions as other models)
+# I/O helpers (Parquet-based, single + multi-file)
 # -------------------------------------------------------------------
-def load_csv_local(root: str, rel_path: str) -> pd.DataFrame:
+def load_parquet_local(root: str, rel_path: str) -> pd.DataFrame:
     path = os.path.join(root, rel_path)
-    logger.info("Reading local CSV: %s", path)
+    logger.info("Reading local Parquet: %s", path)
     if not os.path.exists(path):
         raise FileNotFoundError(f"Input file not found: {path}")
-    return pd.read_csv(path, sep=",", dtype=str)
+    return pd.read_parquet(path)
 
 
-def load_csv_s3(bucket: str, key: str) -> pd.DataFrame:
-    logger.info("Reading CSV from s3://%s/%s", bucket, key)
+def load_parquet_local_multi(root: str, rel_dir: str, filename_substr: str) -> pd.DataFrame:
+    dir_path = os.path.join(root, rel_dir)
+    logger.info("Reading multiple local Parquet files from: %s (filter=%r)", dir_path, filename_substr)
+    if not os.path.isdir(dir_path):
+        raise FileNotFoundError(f"Input directory not found: {dir_path}")
+
+    dfs = []
+    for fname in sorted(os.listdir(dir_path)):
+        if not fname.lower().endswith(".parquet"):
+            continue
+        if filename_substr and (filename_substr not in fname):
+            continue
+        full_path = os.path.join(dir_path, fname)
+        logger.info("  - including %s", full_path)
+        dfs.append(pd.read_parquet(full_path))
+
+    if not dfs:
+        raise FileNotFoundError(
+            f"No Parquet files in {dir_path} matching substring {filename_substr!r}"
+        )
+
+    df = pd.concat(dfs, ignore_index=True)
+    logger.info("Concatenated local Parquet: %d rows, %d columns", len(df), len(df.columns))
+    return df
+
+
+def load_parquet_s3(bucket: str, key: str) -> pd.DataFrame:
+    logger.info("Reading Parquet from s3://%s/%s", bucket, key)
     s3 = boto3.client("s3")
-    with tempfile.NamedTemporaryFile(suffix=".csv") as tmp:
+    with tempfile.NamedTemporaryFile(suffix=".parquet") as tmp:
         s3.download_fileobj(bucket, key, tmp)
         tmp.flush()
         tmp.seek(0)
-        return pd.read_csv(tmp.name, sep=",", dtype=str)
+        return pd.read_parquet(tmp.name)
 
 
-def derive_output_paths(base_key: str, output_format: str):
-    """
-    Derive bike & ped output keys from a base OUTPUT_KEY.
-    Example:
-      base_key = "silver/zurich_pedbike_flows.gpkg"
-      -> bike: "silver/zurich_pedbike_flows_bike.gpkg"
-         ped : "silver/zurich_pedbike_flows_ped.gpkg"
-    """
-    if output_format == "gpkg":
-        ext = ".gpkg"
-    else:
-        ext = ".parquet"
+def load_parquet_s3_multi(bucket: str, prefix: str, filename_substr: str) -> pd.DataFrame:
+    logger.info(
+        "Reading multiple Parquet files from s3://%s/%s* (filter=%r)",
+        bucket,
+        prefix,
+        filename_substr,
+    )
+    s3 = boto3.client("s3")
+    dfs = []
+    continuation_token = None
 
-    if base_key.lower().endswith(ext):
-        base = base_key[:-len(ext)]
-    else:
-        base = base_key
+    while True:
+        kwargs = {"Bucket": bucket, "Prefix": prefix}
+        if continuation_token:
+            kwargs["ContinuationToken"] = continuation_token
 
-    bike_key = base + "_bike" + ext
-    ped_key = base + "_ped" + ext
-    return bike_key, ped_key
+        resp = s3.list_objects_v2(**kwargs)
+        contents = resp.get("Contents", [])
+        for obj in contents:
+            key = obj["Key"]
+            fname = os.path.basename(key)
+            if not fname.lower().endswith(".parquet"):
+                continue
+            if filename_substr and (filename_substr not in fname):
+                continue
 
+            logger.info("  - including s3://%s/%s", bucket, key)
+            with tempfile.NamedTemporaryFile(suffix=".parquet") as tmp:
+                s3.download_fileobj(bucket, key, tmp)
+                tmp.flush()
+                tmp.seek(0)
+                dfs.append(pd.read_parquet(tmp.name))
 
-def save_geodataframe(
-    gdf: gpd.GeoDataFrame,
-    output_format: str,
-    local_root: str | None,
-    output_path_or_key: str,
-    use_s3: bool,
-    output_bucket: str | None,
-):
-    """
-    Save GeoDataFrame either locally or to S3 as one file.
-    """
-    if use_s3:
-        assert output_bucket is not None
-        s3 = boto3.client("s3")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            if output_format == "gpkg":
-                tmp_name = "pedbike_flow.gpkg"
-                tmp_path = os.path.join(tmpdir, tmp_name)
-                gdf.to_file(tmp_path, driver="GPKG")
-            else:
-                tmp_name = "pedbike_flow.parquet"
-                tmp_path = os.path.join(tmpdir, tmp_name)
-                gdf.to_parquet(tmp_path, index=False)
-
-            size_bytes = os.path.getsize(tmp_path)
-            logger.info("Temporary output %s (size=%d bytes)", tmp_path, size_bytes)
-            s3.upload_file(tmp_path, output_bucket, output_path_or_key)
-        logger.info("Uploaded output to s3://%s/%s", output_bucket, output_path_or_key)
-    else:
-        assert local_root is not None
-        out_path = os.path.join(local_root, output_path_or_key)
-        out_dir = os.path.dirname(out_path)
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-        if output_format == "gpkg":
-            gdf.to_file(out_path, driver="GPKG")
+        if resp.get("IsTruncated"):
+            continuation_token = resp.get("NextContinuationToken")
         else:
-            gdf.to_parquet(out_path, index=False)
-        logger.info("Output written locally to %s", out_path)
+            break
+
+    if not dfs:
+        raise FileNotFoundError(
+            f"No Parquet files under s3://{bucket}/{prefix} matching substring {filename_substr!r}"
+        )
+
+    df = pd.concat(dfs, ignore_index=True)
+    logger.info("Concatenated S3 Parquet: %d rows, %d columns", len(df), len(df.columns))
+    return df
+
+
+def save_df_parquet_local(df: pd.DataFrame, path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    df_to_write = coerce_object_to_string_for_parquet(df, geometry_col=None)
+    logger.info("Writing local Parquet: %s", path)
+    df_to_write.to_parquet(path, index=False)
+
+
+def save_df_parquet_s3(df: pd.DataFrame, bucket: str, key: str):
+    df_to_write = coerce_object_to_string_for_parquet(df, geometry_col=None)
+    s3 = boto3.client("s3")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = os.path.join(tmpdir, "tmp_flows.parquet")
+        df_to_write.to_parquet(tmp_path, index=False)
+        size_bytes = os.path.getsize(tmp_path)
+        logger.info("Temporary Parquet %s (size=%d bytes)", tmp_path, size_bytes)
+        logger.info("Uploading to s3://%s/%s", bucket, key)
+        s3.upload_file(tmp_path, bucket, key)
+
 
 # -------------------------------------------------------------------
 # Propagation models
@@ -255,11 +374,11 @@ PED_MODEL_PARAMS = {
 }
 
 
-def propagate_bike_flows(G: nx.MultiDiGraph, seeds_gdf: gpd.GeoDataFrame, params: dict):
+def propagate_bike_flows(G: nx.MultiDiGraph, seeds_df: pd.DataFrame, params: dict):
     """
-    Propagate daily cyclist flows from seed edges through the bike network.
+    Propagate cyclist flows from seed edges through the bike network for ONE timestep.
 
-    seeds_gdf: FK_STANDORT, VELO_DAY, VELO_IN_SHARE, VELO_OUT_SHARE, u, v, key
+    seeds_df: FK_STANDORT, VELO_DAY, VELO_IN_SHARE, VELO_OUT_SHARE, u, v, key
     """
     max_distance_m = params["max_distance_m"]
     min_flow = params["min_flow"]
@@ -269,7 +388,7 @@ def propagate_bike_flows(G: nx.MultiDiGraph, seeds_gdf: gpd.GeoDataFrame, params
 
     edge_flow = defaultdict(float)
 
-    for idx, seed in seeds_gdf.iterrows():
+    for idx, seed in seeds_df.iterrows():
         base_flow = float(seed["VELO_DAY"])
         if base_flow <= 0:
             continue
@@ -277,6 +396,9 @@ def propagate_bike_flows(G: nx.MultiDiGraph, seeds_gdf: gpd.GeoDataFrame, params
         u0 = seed["u"]
         v0 = seed["v"]
         k0 = seed["key"]
+
+        if pd.isna(u0) or pd.isna(v0) or pd.isna(k0):
+            continue
 
         if not G.has_edge(u0, v0, k0):
             continue
@@ -373,11 +495,11 @@ def propagate_bike_flows(G: nx.MultiDiGraph, seeds_gdf: gpd.GeoDataFrame, params
     return edge_flow
 
 
-def propagate_ped_flows(G: nx.MultiDiGraph, seeds_gdf: gpd.GeoDataFrame, params: dict):
+def propagate_ped_flows(G: nx.MultiDiGraph, seeds_df: pd.DataFrame, params: dict):
     """
-    Propagate daily pedestrian flows from seed edges through the pedestrian network.
+    Propagate pedestrian flows from seed edges through the pedestrian network for ONE timestep.
 
-    seeds_gdf: FK_STANDORT, FUSS_DAY, FUSS_IN_SHARE, FUSS_OUT_SHARE, u, v, key
+    seeds_df: FK_STANDORT, FUSS_DAY, FUSS_IN_SHARE, FUSS_OUT_SHARE, u, v, key
     """
     max_distance_m = params["max_distance_m"]
     min_flow = params["min_flow"]
@@ -387,7 +509,7 @@ def propagate_ped_flows(G: nx.MultiDiGraph, seeds_gdf: gpd.GeoDataFrame, params:
 
     edge_flow = defaultdict(float)
 
-    for idx, seed in seeds_gdf.iterrows():
+    for idx, seed in seeds_df.iterrows():
         base_flow = float(seed["FUSS_DAY"])
         if base_flow <= 0:
             continue
@@ -395,6 +517,9 @@ def propagate_ped_flows(G: nx.MultiDiGraph, seeds_gdf: gpd.GeoDataFrame, params:
         u0 = seed["u"]
         v0 = seed["v"]
         k0 = seed["key"]
+
+        if pd.isna(u0) or pd.isna(v0) or pd.isna(k0):
+            continue
 
         if not G.has_edge(u0, v0, k0):
             continue
@@ -488,130 +613,138 @@ def propagate_ped_flows(G: nx.MultiDiGraph, seeds_gdf: gpd.GeoDataFrame, params:
 
     return edge_flow
 
+
 # -------------------------------------------------------------------
 # MAIN
 # -------------------------------------------------------------------
 def main():
     # --------------------------------------------------------------
-    # I/O config (same pattern as other models)
+    # I/O config
     # --------------------------------------------------------------
     input_bucket = os.getenv("INPUT_BUCKET")
     input_key = os.getenv("INPUT_KEY")
+    input_prefix = os.getenv("INPUT_PREFIX")  # for S3 multi-file
+    input_dir = os.getenv("INPUT_DIR")        # for local multi-file
     output_bucket = os.getenv("OUTPUT_BUCKET")
-    output_key = os.getenv("OUTPUT_KEY")
+    output_prefix = os.getenv("OUTPUT_PREFIX")
 
     local_root = os.getenv("LOCAL_BUCKET_ROOT", "/data")
-    default_csv_name = os.getenv(
-        "PEDESTRIAN_VELO_CSV_FILE",
-        "2025_verkehrszaehlungen_werte_fussgaenger_velo.csv",
+    default_parquet_name = os.getenv(
+        "PEDESTRIAN_VELO_PARQUET_FILE",
+        "2025_verkehrszaehlungen_werte_fussgaenger_velo.parquet",
     )
+    filename_substr = os.getenv("INPUT_FILENAME_SUBSTR", "pedestrian")
 
-    use_s3 = all([input_bucket, input_key, output_bucket, output_key])
+    # Decide whether we are in S3 mode
+    use_s3 = bool(input_bucket and output_bucket and (input_key or input_prefix))
 
-    if not output_key:
-        output_key = "pedbike_flows.gpkg"
-
-    if not input_key:
-        input_key = default_csv_name
-
-    output_format_raw = os.getenv("OUTPUT_FORMAT", "gpkg").strip().lower()
-    if output_format_raw in ("gpkg", "geopackage"):
-        output_format = "gpkg"
-    elif output_format_raw in ("parquet", "geoparquet"):
-        output_format = "parquet"
-    else:
-        logger.warning("Unknown OUTPUT_FORMAT=%r, defaulting to 'gpkg'", output_format_raw)
-        output_format = "gpkg"
-
+    # Base name for outputs
     if use_s3:
+        base_name = output_prefix or "pedbike_flows"
         logger.info("Running in S3 mode.")
-        logger.info("Input:  s3://%s/%s", input_bucket, input_key)
-        logger.info("Output base: s3://%s/%s", output_bucket, output_key)
+        if input_prefix:
+            logger.info(
+                "Input multi-file: s3://%s/%s* (filter=%r)",
+                input_bucket,
+                input_prefix,
+                filename_substr,
+            )
+        else:
+            effective_key = input_key or default_parquet_name
+            logger.info("Input single file: s3://%s/%s", input_bucket, effective_key)
+        logger.info("Output base prefix: s3://%s/%s", output_bucket, base_name)
     else:
+        output_dir = os.getenv("OUTPUT_DIR", "pedbike_flows")
+        base_name = output_dir
         logger.info("Running in local mode.")
         logger.info("Local root: %s", local_root)
-        logger.info("Input:  %s", os.path.join(local_root, input_key))
-        logger.info("Output base: %s", os.path.join(local_root, output_key))
 
-    logger.info("Output format: %s", output_format)
-
-    bike_output_key, ped_output_key = derive_output_paths(output_key, output_format)
-    logger.info("Bike output key: %s", bike_output_key)
-    logger.info("Ped  output key: %s", ped_output_key)
+        if input_dir:
+            logger.info(
+                "Input multi-file: %s (relative to LOCAL_BUCKET_ROOT, filter=%r)",
+                input_dir,
+                filename_substr,
+            )
+        else:
+            effective_key = input_key or default_parquet_name
+            logger.info(
+                "Input single file: %s",
+                os.path.join(local_root, effective_key),
+            )
+        logger.info("Output base dir: %s", os.path.join(local_root, output_dir))
 
     # --------------------------------------------------------------
-    # 1. Load input CSV
+    # 1. Load input Parquet(s)
     # --------------------------------------------------------------
     if use_s3:
-        df_raw = load_csv_s3(input_bucket, input_key)
+        if input_prefix:
+            df_raw = load_parquet_s3_multi(input_bucket, input_prefix, filename_substr)
+        else:
+            effective_key = input_key or default_parquet_name
+            df_raw = load_parquet_s3(input_bucket, effective_key)
     else:
-        df_raw = load_csv_local(local_root, input_key)
+        if input_dir:
+            df_raw = load_parquet_local_multi(local_root, input_dir, filename_substr)
+        else:
+            effective_key = input_key or default_parquet_name
+            df_raw = load_parquet_local(local_root, effective_key)
 
     logger.info("Loaded raw counts: %d rows, %d columns", len(df_raw), len(df_raw.columns))
 
     # --------------------------------------------------------------
-    # 2. Date parsing & daily aggregation
+    # 2. Parse datetime & numeric flows (keep all observations)
     # --------------------------------------------------------------
     df_raw["DATUM"] = pd.to_datetime(df_raw["DATUM"], errors="coerce")
-    df_raw["DATE"] = df_raw["DATUM"].dt.date
 
     agg_cols = ["VELO_IN", "VELO_OUT", "FUSS_IN", "FUSS_OUT"]
     for col in agg_cols:
-        df_raw[col] = pd.to_numeric(df_raw[col], errors="coerce").fillna(0)
+        if col in df_raw.columns:
+            df_raw[col] = pd.to_numeric(df_raw[col], errors="coerce").fillna(0.0)
+        else:
+            df_raw[col] = 0.0
 
-    df_daily = (
-        df_raw
-        .groupby(["FK_STANDORT", "DATE"], as_index=False)[agg_cols]
-        .sum()
-    )
+    df_raw["VELO_DAY"] = df_raw["VELO_IN"] + df_raw["VELO_OUT"]
+    df_raw["FUSS_DAY"] = df_raw["FUSS_IN"] + df_raw["FUSS_OUT"]
 
-    df_daily["VELO_DAY"] = df_daily["VELO_IN"] + df_daily["VELO_OUT"]
-    df_daily["FUSS_DAY"] = df_daily["FUSS_IN"] + df_daily["FUSS_OUT"]
+    df_raw["VELO_IN_SHARE"] = df_raw["VELO_IN"].div(df_raw["VELO_DAY"]).fillna(0.0)
+    df_raw["VELO_OUT_SHARE"] = df_raw["VELO_OUT"].div(df_raw["VELO_DAY"]).fillna(0.0)
 
-    df_daily["VELO_IN_SHARE"] = df_daily["VELO_IN"].div(df_daily["VELO_DAY"]).fillna(0.0)
-    df_daily["VELO_OUT_SHARE"] = df_daily["VELO_OUT"].div(df_daily["VELO_DAY"]).fillna(0.0)
+    df_raw["FUSS_IN_SHARE"] = df_raw["FUSS_IN"].div(df_raw["FUSS_DAY"]).fillna(0.0)
+    df_raw["FUSS_OUT_SHARE"] = df_raw["FUSS_OUT"].div(df_raw["FUSS_DAY"]).fillna(0.0)
 
-    df_daily["FUSS_IN_SHARE"] = df_daily["FUSS_IN"].div(df_daily["FUSS_DAY"]).fillna(0.0)
-    df_daily["FUSS_OUT_SHARE"] = df_daily["FUSS_OUT"].div(df_daily["FUSS_DAY"]).fillna(0.0)
+    df_raw["DATE"] = df_raw["DATUM"].dt.date
+    df_raw["HOUR"] = df_raw["DATUM"].dt.hour
 
-    df_daily["DATE"] = pd.to_datetime(df_daily["DATE"])
+    # Coordinates
+    df_raw["OST"] = pd.to_numeric(df_raw["OST"], errors="coerce")
+    df_raw["NORD"] = pd.to_numeric(df_raw["NORD"], errors="coerce")
 
-    flow_cols = [
-        "VELO_DAY", "FUSS_DAY",
-        "VELO_IN", "VELO_OUT",
-        "FUSS_IN", "FUSS_OUT",
-        "VELO_IN_SHARE", "VELO_OUT_SHARE",
-        "FUSS_IN_SHARE", "FUSS_OUT_SHARE",
-    ]
-
-    df_station_daily = (
-        df_daily
-        .groupby("FK_STANDORT", as_index=False)[flow_cols]
-        .mean()
-    )
-
+    # Station-level coords (one row per FK_STANDORT)
     df_coords = (
         df_raw
         .groupby("FK_STANDORT", as_index=False)[["OST", "NORD"]]
         .first()
     )
 
-    df_coords["OST"] = pd.to_numeric(df_coords["OST"], errors="coerce")
-    df_coords["NORD"] = pd.to_numeric(df_coords["NORD"], errors="coerce")
+    # Station-level total flows (for filtering bike/ped stations)
+    station_flows = (
+        df_raw
+        .groupby("FK_STANDORT", as_index=False)[["VELO_DAY", "FUSS_DAY"]]
+        .sum()
+    )
 
-    df_station_daily = df_station_daily.merge(df_coords, on="FK_STANDORT", how="left")
-    logger.info("Stations after merging coords: %d", len(df_station_daily))
+    df_station = station_flows.merge(df_coords, on="FK_STANDORT", how="left")
+    logger.info("Stations after merging coords: %d", len(df_station))
 
     # --------------------------------------------------------------
     # 3. Build station GeoDataFrames (LV95 -> WGS84)
     # --------------------------------------------------------------
     gdf_stations = gpd.GeoDataFrame(
-        df_station_daily.copy(),
-        geometry=gpd.points_from_xy(df_station_daily["OST"], df_station_daily["NORD"]),
+        df_station.copy(),
+        geometry=gpd.points_from_xy(df_station["OST"], df_station["NORD"]),
         crs="EPSG:2056",  # LV95
     )
 
-    # Keep original LV95 for output if needed, but for network ops we go to 4326
     gdf_stations_4326 = gdf_stations.to_crs(epsg=4326)
 
     gdf_bike_stations = gdf_stations_4326[gdf_stations_4326["VELO_DAY"] > 0].copy()
@@ -652,9 +785,9 @@ def main():
     logger.info("Ped edges: %d", len(edges_ped_gdf))
 
     # --------------------------------------------------------------
-    # 5. Snap bike and ped stations to nearest edges (in LV95)
+    # 5. Snap stations to nearest edges (in LV95) to get u,v,key mapping
     # --------------------------------------------------------------
-    # Bike
+    # Bike snapping
     gdf_bike_proj = gdf_bike_stations.to_crs(epsg=2056)
     edges_bike_proj = edges_bike_gdf.to_crs(epsg=2056).reset_index()
     edges_bike_snap = edges_bike_proj[["u", "v", "key", "geometry"]].copy()
@@ -666,28 +799,26 @@ def main():
         distance_col="snap_distance_m",
     ).to_crs(epsg=4326)
 
-    bike_seeds = bike_station_edges[
+    bike_station_edges = bike_station_edges[
         [
             "FK_STANDORT",
-            "VELO_DAY",
-            "VELO_IN_SHARE",
-            "VELO_OUT_SHARE",
             "u",
             "v",
             "key",
             "snap_distance_m",
-            "geometry",
         ]
     ].copy()
 
     logger.info(
-        "Bike seeds: %d (snap distance min=%.2f m, max=%.2f m)",
-        len(bike_seeds),
-        float(bike_seeds["snap_distance_m"].min()),
-        float(bike_seeds["snap_distance_m"].max()),
+        "Bike station-edge matches: %d (snap distance min=%.2f m, max=%.2f m)",
+        len(bike_station_edges),
+        float(bike_station_edges["snap_distance_m"].min())
+        if len(bike_station_edges) > 0 else float("nan"),
+        float(bike_station_edges["snap_distance_m"].max())
+        if len(bike_station_edges) > 0 else float("nan"),
     )
 
-    # Ped
+    # Ped snapping
     gdf_ped_proj = gdf_ped_stations.to_crs(epsg=2056)
     edges_ped_proj = edges_ped_gdf.to_crs(epsg=2056).reset_index()
     edges_ped_snap = edges_ped_proj[["u", "v", "key", "geometry"]].copy()
@@ -699,137 +830,305 @@ def main():
         distance_col="snap_distance_m",
     ).to_crs(epsg=4326)
 
-    ped_seeds = ped_station_edges[
+    ped_station_edges = ped_station_edges[
         [
             "FK_STANDORT",
-            "FUSS_DAY",
-            "FUSS_IN_SHARE",
-            "FUSS_OUT_SHARE",
             "u",
             "v",
             "key",
             "snap_distance_m",
-            "geometry",
         ]
     ].copy()
 
     logger.info(
-        "Ped seeds: %d (snap distance min=%.2f m, max=%.2f m)",
-        len(ped_seeds),
-        float(ped_seeds["snap_distance_m"].min()),
-        float(ped_seeds["snap_distance_m"].max()),
+        "Ped station-edge matches: %d (snap distance min=%.2f m, max=%.2f m)",
+        len(ped_station_edges),
+        float(ped_station_edges["snap_distance_m"].min())
+        if len(ped_station_edges) > 0 else float("nan"),
+        float(ped_station_edges["snap_distance_m"].max())
+        if len(ped_station_edges) > 0 else float("nan"),
     )
 
     # --------------------------------------------------------------
-    # 6. Propagate flows (bike + ped)
+    # 6. Build seeds per observation (keep all timestamps)
     # --------------------------------------------------------------
-    logger.info("Propagating bike flows ...")
-    bike_edge_flows = propagate_bike_flows(G_bike, bike_seeds, BIKE_MODEL_PARAMS)
+    df_bike_obs = df_raw[df_raw["VELO_DAY"] > 0].copy()
+    df_ped_obs = df_raw[df_raw["FUSS_DAY"] > 0].copy()
 
-    df_bike_flows = pd.DataFrame(
-        [
-            {"u": u, "v": v, "key": k, "bike_flow_daily": flow}
-            for (u, v, k), flow in bike_edge_flows.items()
-        ]
-    )
-
-    logger.info("Bike edge flows records: %d", len(df_bike_flows))
-
-    logger.info("Propagating pedestrian flows ...")
-    ped_edge_flows = propagate_ped_flows(G_ped, ped_seeds, PED_MODEL_PARAMS)
-
-    df_ped_flows = pd.DataFrame(
-        [
-            {"u": u, "v": v, "key": k, "ped_flow_daily": flow}
-            for (u, v, k), flow in ped_edge_flows.items()
-        ]
-    )
-
-    logger.info("Ped edge flows records: %d", len(df_ped_flows))
-
-    # --------------------------------------------------------------
-    # 7. Join flows back to edges, normalize, reproject to EPSG:2056
-    # --------------------------------------------------------------
-    # Bike
-    edges_bike_with_index = edges_bike_gdf.reset_index()
-    edges_bike_with_flow = edges_bike_with_index.merge(
-        df_bike_flows,
-        on=["u", "v", "key"],
+    df_bike_seeds = df_bike_obs.merge(
+        bike_station_edges,
+        on="FK_STANDORT",
         how="left",
     )
 
-    edges_bike_with_flow["bike_flow_daily"] = edges_bike_with_flow["bike_flow_daily"].fillna(0.0)
+    df_ped_seeds = df_ped_obs.merge(
+        ped_station_edges,
+        on="FK_STANDORT",
+        how="left",
+    )
 
-    max_bike_flow = edges_bike_with_flow["bike_flow_daily"].max()
-    if max_bike_flow > 0:
-        edges_bike_with_flow["bike_flow_norm"] = edges_bike_with_flow["bike_flow_daily"] / max_bike_flow
+    logger.info("Bike observations with VELO_DAY>0: %d", len(df_bike_seeds))
+    logger.info("Ped observations with FUSS_DAY>0: %d", len(df_ped_seeds))
+
+    # --------------------------------------------------------------
+    # 7. Propagate flows for each timestamp (hourly)
+    # --------------------------------------------------------------
+    # Bike
+    bike_flow_records = []
+    if len(df_bike_seeds) > 0:
+        bike_times = sorted(df_bike_seeds["DATUM"].dropna().unique())
+        total_bike = len(bike_times)
+        logger.info("Unique bike timesteps: %d", total_bike)
+
+        next_pct_bike = 10  # next percentage threshold to log
+
+        for i, tstamp in enumerate(bike_times, start=1):
+            seeds_t = df_bike_seeds[df_bike_seeds["DATUM"] == tstamp]
+            if seeds_t["VELO_DAY"].sum() <= 0:
+                continue
+
+            # existing per-timestep log (keep or drop, up to you)
+            logger.info(
+                "Propagating bike flows (%d/%d) for %s ...",
+                i,
+                total_bike,
+                tstamp,
+            )
+
+            edge_flows_t = propagate_bike_flows(G_bike, seeds_t, BIKE_MODEL_PARAMS)
+
+            for (u, v, k), flow in edge_flows_t.items():
+                bike_flow_records.append(
+                    {
+                        "DATUM": tstamp,
+                        "DATE": tstamp.date(),
+                        "HOUR": tstamp.hour,
+                        "u": u,
+                        "v": v,
+                        "key": k,
+                        "bike_flow": flow,
+                    }
+                )
+
+            # --- 10% progress logging ---
+            if total_bike > 0:
+                pct = int(100 * i / total_bike)
+                if pct >= next_pct_bike:
+                    logger.info(
+                        "Bike propagation progress: %d%% (%d/%d timesteps)",
+                        next_pct_bike,
+                        i,
+                        total_bike,
+                    )
+                    next_pct_bike += 10
+
+        if total_bike > 0:
+            logger.info(
+                "Bike propagation progress: 100%% (%d/%d timesteps)",
+                total_bike,
+                total_bike,
+            )
+
+    df_bike_flows_all = pd.DataFrame(bike_flow_records)
+    logger.info("Bike flow records (edge×time): %d", len(df_bike_flows_all))
+
+    # Ped
+    ped_flow_records = []
+    if len(df_ped_seeds) > 0:
+        ped_times = sorted(df_ped_seeds["DATUM"].dropna().unique())
+        total_ped = len(ped_times)
+        logger.info("Unique ped timesteps: %d", total_ped)
+
+        next_pct_ped = 10  # next percentage threshold to log
+
+        for i, tstamp in enumerate(ped_times, start=1):
+            seeds_t = df_ped_seeds[df_ped_seeds["DATUM"] == tstamp]
+            if seeds_t["FUSS_DAY"].sum() <= 0:
+                continue
+
+            logger.info(
+                "Propagating ped flows (%d/%d) for %s ...",
+                i,
+                total_ped,
+                tstamp,
+            )
+
+            edge_flows_t = propagate_ped_flows(G_ped, seeds_t, PED_MODEL_PARAMS)
+
+            for (u, v, k), flow in edge_flows_t.items():
+                ped_flow_records.append(
+                    {
+                        "DATUM": tstamp,
+                        "DATE": tstamp.date(),
+                        "HOUR": tstamp.hour,
+                        "u": u,
+                        "v": v,
+                        "key": k,
+                        "ped_flow": flow,
+                    }
+                )
+
+            # --- 10% progress logging ---
+            if total_ped > 0:
+                pct = int(100 * i / total_ped)
+                if pct >= next_pct_ped:
+                    logger.info(
+                        "Ped propagation progress: %d%% (%d/%d timesteps)",
+                        next_pct_ped,
+                        i,
+                        total_ped,
+                    )
+                    next_pct_ped += 10
+
+        if total_ped > 0:
+            logger.info(
+                "Ped propagation progress: 100%% (%d/%d timesteps)",
+                total_ped,
+                total_ped,
+            )
+
+
+    df_ped_flows_all = pd.DataFrame(ped_flow_records)
+    logger.info("Ped flow records (edge×time): %d", len(df_ped_flows_all))
+
+    # --------------------------------------------------------------
+    # 8. Compute flow_norm per mode (0–1 across all edge×time)
+    # --------------------------------------------------------------
+    if not df_bike_flows_all.empty:
+        max_bike_flow = df_bike_flows_all["bike_flow"].max()
+        if max_bike_flow > 0:
+            df_bike_flows_all["bike_flow_norm"] = df_bike_flows_all["bike_flow"] / max_bike_flow
+        else:
+            df_bike_flows_all["bike_flow_norm"] = 0.0
     else:
-        edges_bike_with_flow["bike_flow_norm"] = 0.0
+        df_bike_flows_all["bike_flow_norm"] = []
+
+    if not df_ped_flows_all.empty:
+        max_ped_flow = df_ped_flows_all["ped_flow"].max()
+        if max_ped_flow > 0:
+            df_ped_flows_all["ped_flow_norm"] = df_ped_flows_all["ped_flow"] / max_ped_flow
+        else:
+            df_ped_flows_all["ped_flow_norm"] = 0.0
+    else:
+        df_ped_flows_all["ped_flow_norm"] = []
+
+    # --------------------------------------------------------------
+    # 9. Build normalized edges (unique edges, no time)
+    # --------------------------------------------------------------
+    # Keep original CRS (likely EPSG:4326), then reproject to EPSG:2056 at the end
+    edges_bike_with_index = edges_bike_gdf.reset_index()
+    edges_ped_with_index = edges_ped_gdf.reset_index()
 
     gdf_bike_edges = gpd.GeoDataFrame(
-        edges_bike_with_flow,
+        edges_bike_with_index.copy(),
         geometry="geometry",
         crs=edges_bike_gdf.crs,
     ).to_crs(epsg=2056)
 
-    logger.info(
-        "Bike edges with bike_flow_daily > 0: %d / %d (CRS=%s)",
-        int((gdf_bike_edges["bike_flow_daily"] > 0).sum()),
-        len(gdf_bike_edges),
-        gdf_bike_edges.crs,
-    )
-
-    # Ped
-    edges_ped_with_index = edges_ped_gdf.reset_index()
-    edges_ped_with_flow = edges_ped_with_index.merge(
-        df_ped_flows,
-        on=["u", "v", "key"],
-        how="left",
-    )
-
-    edges_ped_with_flow["ped_flow_daily"] = edges_ped_with_flow["ped_flow_daily"].fillna(0.0)
-
-    max_ped_flow = edges_ped_with_flow["ped_flow_daily"].max()
-    if max_ped_flow > 0:
-        edges_ped_with_flow["ped_flow_norm"] = edges_ped_with_flow["ped_flow_daily"] / max_ped_flow
-    else:
-        edges_ped_with_flow["ped_flow_norm"] = 0.0
-
     gdf_ped_edges = gpd.GeoDataFrame(
-        edges_ped_with_flow,
+        edges_ped_with_index.copy(),
         geometry="geometry",
         crs=edges_ped_gdf.crs,
     ).to_crs(epsg=2056)
 
     logger.info(
-        "Ped edges with ped_flow_daily > 0: %d / %d (CRS=%s)",
-        int((gdf_ped_edges["ped_flow_daily"] > 0).sum()),
+        "Normalized edges — bike: %d, ped: %d",
+        len(gdf_bike_edges),
         len(gdf_ped_edges),
-        gdf_ped_edges.crs,
     )
 
     # --------------------------------------------------------------
-    # 8. Save outputs (two files: bike + ped)
+    # 10. Save outputs – 3 files per type (edges GPKG, edges GeoParquet, flows Parquet)
     # --------------------------------------------------------------
-    save_geodataframe(
-        gdf_bike_edges,
-        output_format=output_format,
-        local_root=None if use_s3 else local_root,
-        output_path_or_key=bike_output_key,
-        use_s3=use_s3,
-        output_bucket=output_bucket,
-    )
+    def make_name(suffix: str) -> str:
+        # For S3, base_name is prefix; for local, it's dir name.
+        return f"{base_name.rstrip('/')}{suffix}"
 
-    save_geodataframe(
-        gdf_ped_edges,
-        output_format=output_format,
-        local_root=None if use_s3 else local_root,
-        output_path_or_key=ped_output_key,
-        use_s3=use_s3,
-        output_bucket=output_bucket,
-    )
+    if use_s3:
+        # Bike
+        save_gdf_s3(
+            gdf_bike_edges,
+            bucket=output_bucket,
+            key=make_name("_bike_edges.gpkg"),
+            as_gpkg=True,
+        )
+        save_gdf_s3(
+            gdf_bike_edges,
+            bucket=output_bucket,
+            key=make_name("_bike_edges.parquet"),
+            as_gpkg=False,
+        )
+        save_df_parquet_s3(
+            df_bike_flows_all,
+            bucket=output_bucket,
+            key=make_name("_bike_flows.parquet"),
+        )
 
-    logger.info("Done. Bike rows: %d, Ped rows: %d", len(gdf_bike_edges), len(gdf_ped_edges))
+        # Ped
+        save_gdf_s3(
+            gdf_ped_edges,
+            bucket=output_bucket,
+            key=make_name("_ped_edges.gpkg"),
+            as_gpkg=True,
+        )
+        save_gdf_s3(
+            gdf_ped_edges,
+            bucket=output_bucket,
+            key=make_name("_ped_edges.parquet"),
+            as_gpkg=False,
+        )
+        save_df_parquet_s3(
+            df_ped_flows_all,
+            bucket=output_bucket,
+            key=make_name("_ped_flows.parquet"),
+        )
+    else:
+        output_dir = base_name
+        base_path = os.path.join(local_root, output_dir)
+        os.makedirs(base_path, exist_ok=True)
+
+        def local_path(filename: str) -> str:
+            return os.path.join(base_path, filename)
+
+        # Bike
+        save_gdf_local(
+            gdf_bike_edges,
+            path=local_path("bike_edges.gpkg"),
+            as_gpkg=True,
+        )
+        save_gdf_local(
+            gdf_bike_edges,
+            path=local_path("bike_edges.parquet"),
+            as_gpkg=False,
+        )
+        save_df_parquet_local(
+            df_bike_flows_all,
+            path=local_path("bike_flows.parquet"),
+        )
+
+        # Ped
+        save_gdf_local(
+            gdf_ped_edges,
+            path=local_path("ped_edges.gpkg"),
+            as_gpkg=True,
+        )
+        save_gdf_local(
+            gdf_ped_edges,
+            path=local_path("ped_edges.parquet"),
+            as_gpkg=False,
+        )
+        save_df_parquet_local(
+            df_ped_flows_all,
+            path=local_path("ped_flows.parquet"),
+        )
+
+    logger.info(
+        "Done. Bike edges: %d, bike flow records: %d | Ped edges: %d, ped flow records: %d",
+        len(gdf_bike_edges),
+        len(df_bike_flows_all),
+        len(gdf_ped_edges),
+        len(df_ped_flows_all),
+    )
 
 
 if __name__ == "__main__":
