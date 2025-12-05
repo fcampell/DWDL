@@ -1,10 +1,14 @@
 #!/usr/bin/env python
 """
-VBZ passenger flows in Zürich – from raw VBZ CSVs to georeferenced flows.
+VBZ passenger flows in Zürich – from raw VBZ Parquet files to georeferenced flows.
 
 This script replicates the notebook pipeline and adds:
 - Local vs S3 input/output handling via environment variables.
-- Single output file, either GPKG or Parquet, controlled by env vars.
+- Multiple outputs in a single run:
+    1) Full flows as GeoPackage
+    2) Full flows as GeoParquet
+    3) Normalized edges-only GeoParquet
+    4) Normalized flows table as Parquet
 
 Environment variables (pattern taken from run_visibility_model.py):
 
@@ -12,48 +16,64 @@ Core I/O
 -------
 INPUT_BUCKET       : (optional) S3 bucket for inputs. If set together with
                      INPUT_PREFIX, OUTPUT_BUCKET, OUTPUT_KEY → S3 mode.
-INPUT_PREFIX       : (optional) S3 "folder"/prefix where VBZ CSV files reside.
-                     e.g. "vbz_raw" (files are expected inside this prefix).
+INPUT_PREFIX       : (optional) "folder"/prefix where VBZ Parquet files reside.
+                     e.g. "silver/public_transport_vbz"
+                     The script expects files relative to this prefix, e.g.:
+                       2025/public_transport_vbz_2025.parquet
+                       reference/haltestellen.parquet
+                       reference/linie.parquet
+                       reference/tagtyp.parquet
 
 OUTPUT_BUCKET      : (optional) S3 bucket for output (S3 mode only).
-OUTPUT_KEY         : (optional) S3 object key for final output.
-                     e.g. "silver/vbz_flows_daily.gpkg"
+OUTPUT_KEY         : (optional) S3 object key PREFIX for final outputs.
+                     e.g. "gold/zurich_vbz_flows"
+                     The script will create 4 files under this prefix:
+                       gold/zurich_vbz_flows/vbz_flows_<level>.gpkg
+                       gold/zurich_vbz_flows/vbz_flows_<level>.parquet
+                       gold/zurich_vbz_flows/vbz_flows_edges.parquet
+                       gold/zurich_vbz_flows/vbz_flows_<level>_table.parquet
 
 LOCAL_BUCKET_ROOT  : (local mode) root directory of your "bucket".
                      default: "/data"
-INPUT_PREFIX       : (also used in local mode) subfolder under LOCAL_BUCKET_ROOT
-                     where VBZ files live, e.g. "vbz_raw".
+                     For local mode, the same OUTPUT_KEY is interpreted as a folder
+                     under LOCAL_BUCKET_ROOT, e.g.:
+                       LOCAL_BUCKET_ROOT=/data
+                       OUTPUT_KEY=gold/zurich_vbz_flows
+                       → /data/gold/zurich_vbz_flows/<files>
 
-VBZ file names (optional overrides)
------------------------------------
-VBZ_REISENDE_FILE      : default "REISENDE.csv"
-VBZ_TAGTYP_FILE        : default "TAGTYP.csv"
-VBZ_HALTESTELLEN_FILE  : default "HALTESTELLEN.csv"
-VBZ_LINIE_FILE         : default "LINIE.csv"
+VBZ file names (optional overrides, relative to INPUT_PREFIX)
+------------------------------------------------------------
+VBZ_REISENDE_FILE      : default "2025/public_transport_vbz_2025.parquet"
+VBZ_TAGTYP_FILE        : default "reference/tagtyp.parquet"
+VBZ_HALTESTELLEN_FILE  : default "reference/haltestellen.parquet"
+VBZ_LINIE_FILE         : default "reference/linie.parquet"
 
 Processing / output
 -------------------
-OUTPUT_FORMAT      : "gpkg" (default) or "parquet"/"geoparquet"
 OUTPUT_LEVEL       : "daily" (default) or "hourly"
 GTFS_URL           : optional override for GTFS ZIP URL.
 LOG_LEVEL          : logging level (e.g. "INFO", "DEBUG")
 
+The script ALWAYS writes 4 outputs (both in local and S3 mode):
+  1) Full flows as GeoPackage
+  2) Full flows as GeoParquet
+  3) Normalized edges-only GeoParquet
+  4) Normalized flows table as Parquet (no geometry)
+
 Typical local run:
 ------------------
 LOCAL_BUCKET_ROOT=/data \
-INPUT_PREFIX=vbz_raw \
-OUTPUT_KEY="silver/vbz_flows_daily.gpkg" \
-OUTPUT_FORMAT=gpkg \
+INPUT_PREFIX="silver/public_transport_vbz" \
+OUTPUT_KEY="gold/zurich_vbz_flows" \
 OUTPUT_LEVEL=daily \
 python run_vbz_flows_model.py
 
 Typical S3/ECS run:
 -------------------
 INPUT_BUCKET=your-bucket \
-INPUT_PREFIX=bronze/vbz \
+INPUT_PREFIX="silver/public_transport_vbz" \
 OUTPUT_BUCKET=your-bucket \
-OUTPUT_KEY="silver/vbz_flows_daily.parquet" \
-OUTPUT_FORMAT=parquet \
+OUTPUT_KEY="gold/zurich_vbz_flows" \
 OUTPUT_LEVEL=daily \
 python run_vbz_flows_model.py
 """
@@ -68,7 +88,7 @@ import boto3
 import requests
 import pandas as pd
 import geopandas as gpd
-from shapely.geometry import Point, LineString
+from shapely.geometry import LineString
 import osmnx as ox
 import networkx as nx
 
@@ -143,22 +163,9 @@ def main():
     input_bucket = os.getenv("INPUT_BUCKET")
     input_prefix = os.getenv("INPUT_PREFIX", "").strip()
     output_bucket = os.getenv("OUTPUT_BUCKET")
-    output_key = os.getenv("OUTPUT_KEY")
+    output_key = os.getenv("OUTPUT_KEY", "").strip()
 
     use_s3 = all([input_bucket, input_prefix, output_bucket, output_key])
-
-    # Output format
-    output_format_raw = os.getenv("OUTPUT_FORMAT", "gpkg").strip().lower()
-    if output_format_raw in ("gpkg", "geopackage"):
-        output_format = "gpkg"
-    elif output_format_raw in ("parquet", "geoparquet"):
-        output_format = "parquet"
-    else:
-        logger.warning(
-            "Unknown OUTPUT_FORMAT=%r, falling back to 'gpkg'.",
-            output_format_raw,
-        )
-        output_format = "gpkg"
 
     # Output level: daily vs hourly
     output_level_raw = os.getenv("OUTPUT_LEVEL", "daily").strip().lower()
@@ -172,33 +179,32 @@ def main():
 
     local_bucket_root = os.getenv("LOCAL_BUCKET_ROOT", "/data")
 
-    # VBZ file names (can be overridden via env)
-    vbz_reisende_file = os.getenv("VBZ_REISENDE_FILE", "REISENDE.csv")
-    vbz_tagtyp_file = os.getenv("VBZ_TAGTYP_FILE", "TAGTYP.csv")
-    vbz_haltestellen_file = os.getenv("VBZ_HALTESTELLEN_FILE", "HALTESTELLEN.csv")
-    vbz_linie_file = os.getenv("VBZ_LINIE_FILE", "LINIE.csv")
-
-    # Normalize prefix for path/key building
-    def build_path_or_key(prefix: str, filename: str) -> str:
-        if prefix and not prefix.endswith("/"):
-            prefix_local = prefix + os.sep
-            prefix_s3 = prefix + "/"
-        else:
-            prefix_local = prefix
-            prefix_s3 = prefix
-
-        # We only use local version for local mode and s3 version for S3 mode.
-        return prefix_local, prefix_s3, filename
+    # VBZ file names (can be overridden via env) – relative to INPUT_PREFIX
+    vbz_reisende_file = os.getenv(
+        "VBZ_REISENDE_FILE", "2025/public_transport_vbz_2025.parquet"
+    )
+    vbz_tagtyp_file = os.getenv(
+        "VBZ_TAGTYP_FILE", "reference/tagtyp.parquet"
+    )
+    vbz_haltestellen_file = os.getenv(
+        "VBZ_HALTESTELLEN_FILE", "reference/haltestellen.parquet"
+    )
+    vbz_linie_file = os.getenv(
+        "VBZ_LINIE_FILE", "reference/linie.parquet"
+    )
 
     if use_s3:
         logger.info("Running in S3 mode.")
+        logger.info("Input bucket: s3://%s/%s", input_bucket, input_prefix)
+        logger.info("Output bucket/prefix: s3://%s/%s", output_bucket, output_key)
     else:
         logger.info("S3 config not fully set; running in local mode.")
         if not output_key:
-            # Provide a default relative output path for local mode
-            output_key = f"vbz_flows_{output_level}.{output_format}"
+            # Provide a default relative output folder for local mode
+            output_key = f"vbz_flows_{output_level}"
+            logger.info("No OUTPUT_KEY set, using default folder: %s", output_key)
 
-    # Build local input/output paths (only used in local mode)
+    # Build local input directory (only used in local mode)
     if not input_prefix:
         # Default: files directly under LOCAL_BUCKET_ROOT
         input_dir = local_bucket_root
@@ -208,52 +214,54 @@ def main():
     if not os.path.isdir(input_dir) and not use_s3:
         logger.warning("Local input directory %s does not exist yet.", input_dir)
 
+    # Local output root folder
     if not use_s3:
-        output_path = os.path.join(local_bucket_root, output_key)
-        logger.info("Output (local): %s", output_path)
+        out_dir_root = os.path.join(local_bucket_root, output_key)
+        logger.info("Output directory (local): %s", out_dir_root)
+    else:
+        out_dir_root = None  # not used in S3 mode
 
-    logger.info("Output format: %s", output_format)
     logger.info("Output level: %s", output_level)
 
     # -------------------------------
-    # 1. Load VBZ passenger data
+    # 1. Load VBZ passenger data (Parquet)
     # -------------------------------
-    logger.info("Loading VBZ CSVs (REISENDE, TAGTYP, HALTESTELLEN, LINIE)")
+    logger.info("Loading VBZ Parquet files (REISENDE, TAGTYP, HALTESTELLEN, LINIE)")
 
     if use_s3:
         s3 = boto3.client("s3")
 
-        def load_csv_from_s3(bucket: str, prefix: str, filename: str) -> pd.DataFrame:
+        def load_parquet_from_s3(bucket: str, prefix: str, filename: str) -> pd.DataFrame:
             key = prefix
             if key and not key.endswith("/"):
                 key = key + "/"
             key = key + filename
             logger.info("Reading s3://%s/%s", bucket, key)
-            with tempfile.NamedTemporaryFile(suffix=".csv") as tmp:
+            with tempfile.NamedTemporaryFile(suffix=".parquet") as tmp:
                 s3.download_fileobj(bucket, key, tmp)
                 tmp.flush()
                 tmp.seek(0)
-                return pd.read_csv(tmp.name, sep=";")
+                return pd.read_parquet(tmp.name)
 
-        reisende_raw = load_csv_from_s3(input_bucket, input_prefix, vbz_reisende_file)
-        tagtyp = load_csv_from_s3(input_bucket, input_prefix, vbz_tagtyp_file)
-        haltestellen = load_csv_from_s3(
+        reisende_raw = load_parquet_from_s3(input_bucket, input_prefix, vbz_reisende_file)
+        tagtyp = load_parquet_from_s3(input_bucket, input_prefix, vbz_tagtyp_file)
+        haltestellen = load_parquet_from_s3(
             input_bucket, input_prefix, vbz_haltestellen_file
         )
-        linie = load_csv_from_s3(input_bucket, input_prefix, vbz_linie_file)
+        linie = load_parquet_from_s3(input_bucket, input_prefix, vbz_linie_file)
 
     else:
-        def load_csv_local(directory: str, filename: str) -> pd.DataFrame:
+        def load_parquet_local(directory: str, filename: str) -> pd.DataFrame:
             path = os.path.join(directory, filename)
             logger.info("Reading %s", path)
             if not os.path.exists(path):
                 raise FileNotFoundError(f"Input file not found: {path}")
-            return pd.read_csv(path, sep=";")
+            return pd.read_parquet(path)
 
-        reisende_raw = load_csv_local(input_dir, vbz_reisende_file)
-        tagtyp = load_csv_local(input_dir, vbz_tagtyp_file)
-        haltestellen = load_csv_local(input_dir, vbz_haltestellen_file)
-        linie = load_csv_local(input_dir, vbz_linie_file)
+        reisende_raw = load_parquet_local(input_dir, vbz_reisende_file)
+        tagtyp = load_parquet_local(input_dir, vbz_tagtyp_file)
+        haltestellen = load_parquet_local(input_dir, vbz_haltestellen_file)
+        linie = load_parquet_local(input_dir, vbz_linie_file)
 
     logger.info("Loaded REISENDE rows: %d", len(reisende_raw))
     logger.info("Loaded TAGTYP rows:   %d", len(tagtyp))
@@ -265,7 +273,7 @@ def main():
     # -------------------------------
     reisende = reisende_raw.copy()
 
-    # Numeric columns in REISENDE come as text; convert to numeric
+    # Numeric columns in REISENDE may come as text; convert to numeric
     numeric_cols = [
         "Einsteiger", "Aussteiger", "Besetzung", "Distanz",
         "Tage_DTV", "Tage_DWV", "Tage_SA", "Tage_SO",
@@ -397,7 +405,6 @@ def main():
     west = minx - margin
 
     logger.info("Downloading street network (driveable roads) from OSM...")
-    # Correct call signature for osmnx.graph_from_bbox
     G = ox.graph_from_bbox(north, south, east, west, network_type="drive")
 
     logger.info("Downloaded graph with %d nodes, %d edges.", len(G.nodes), len(G.edges))
@@ -500,57 +507,117 @@ def main():
     logger.info("Hourly flows rows: %d", len(flows_hourly))
     logger.info("Daily  flows rows: %d", len(flows_day_gdf))
 
-    # Choose output dataframe
+    # Choose main output dataframe (full flows)
     if output_level == "hourly":
-        gdf_out = flows_hourly
+        gdf_full = flows_hourly
     else:
-        gdf_out = flows_day_gdf
+        gdf_full = flows_day_gdf
 
     # -------------------------------
-    # Save output (single file)
+    # Normalized outputs
     # -------------------------------
-    logger.info("Writing final output (%s, %s)...", output_level, output_format)
+    # Edges-only geometry (GeoParquet)
+    edges_gdf = gpd.GeoDataFrame(
+        unique_segments.copy(), geometry="geometry", crs=graph_crs
+    ).to_crs(target_crs)
 
+    # Flows table (no geometry), matching the chosen aggregation level
+    if "geometry" in gdf_full:
+        flows_table = gdf_full.drop(columns=["geometry"]).copy()
+    else:
+        flows_table = gdf_full.copy()
+
+    logger.info("Preparing 4 outputs (full GPKG, full GeoParquet, edges GeoParquet, flows table Parquet)...")
+
+    # Filenames (no paths; we add folder/prefix below)
+    full_gpkg_name = f"vbz_flows_{output_level}.gpkg"
+    full_geopq_name = f"vbz_flows_{output_level}.parquet"
+    edges_name = "vbz_flows_edges.parquet"
+    flows_name = f"vbz_flows_{output_level}_table.parquet"
+
+    # -------------------------------
+    # Save outputs
+    # -------------------------------
     if use_s3:
         s3 = boto3.client("s3")
-        logger.info("Writing output to s3://%s/%s", output_bucket, output_key)
+        prefix = output_key.rstrip("/")
+
+        logger.info("Writing outputs to s3://%s/%s/...", output_bucket, prefix)
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            if output_format == "gpkg":
-                tmp_filename = "vbz_flows.gpkg"
-                tmp_path = os.path.join(tmpdir, tmp_filename)
-                gdf_out.to_file(tmp_path, driver="GPKG")
-            else:
-                tmp_filename = "vbz_flows.parquet"
-                tmp_path = os.path.join(tmpdir, tmp_filename)
-                gdf_out.to_parquet(tmp_path, index=False)
+            # Full GPKG
+            full_gpkg_path = os.path.join(tmpdir, full_gpkg_name)
+            gdf_full.to_file(full_gpkg_path, driver="GPKG")
 
-            size_bytes = os.path.getsize(tmp_path)
-            logger.info(
-                "Temporary %s written to %s (size=%d bytes)",
-                output_format,
-                tmp_path,
-                size_bytes,
-            )
+            # Full GeoParquet
+            full_geopq_path = os.path.join(tmpdir, full_geopq_name)
+            gdf_full.to_parquet(full_geopq_path, index=False)
 
-            s3.upload_file(tmp_path, output_bucket, output_key)
+            # Edges GeoParquet
+            edges_path = os.path.join(tmpdir, edges_name)
+            edges_gdf.to_parquet(edges_path, index=False)
 
-        logger.info("Uploaded output to s3://%s/%s", output_bucket, output_key)
+            # Flows table Parquet
+            flows_path = os.path.join(tmpdir, flows_name)
+            flows_table.to_parquet(flows_path, index=False)
+
+            # Upload helper
+            def _upload(local_path: str, name: str):
+                key = f"{prefix}/{name}"
+                size_bytes = os.path.getsize(local_path)
+                logger.info(
+                    "Uploading %s (%d bytes) to s3://%s/%s",
+                    name, size_bytes, output_bucket, key
+                )
+                s3.upload_file(local_path, output_bucket, key)
+
+            _upload(full_gpkg_path, full_gpkg_name)
+            _upload(full_geopq_path, full_geopq_name)
+            _upload(edges_path, edges_name)
+            _upload(flows_path, flows_name)
+
+        logger.info(
+            "Uploaded 4 outputs to s3://%s/%s/{%s, %s, %s, %s}",
+            output_bucket,
+            prefix,
+            full_gpkg_name,
+            full_geopq_name,
+            edges_name,
+            flows_name,
+        )
 
     else:
         # Ensure local directory exists
-        out_dir = os.path.dirname(output_path)
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
+        os.makedirs(out_dir_root, exist_ok=True)
 
-        if output_format == "gpkg":
-            gdf_out.to_file(output_path, driver="GPKG")
-        else:
-            gdf_out.to_parquet(output_path, index=False)
+        full_gpkg_path = os.path.join(out_dir_root, full_gpkg_name)
+        full_geopq_path = os.path.join(out_dir_root, full_geopq_name)
+        edges_path = os.path.join(out_dir_root, edges_name)
+        flows_path = os.path.join(out_dir_root, flows_name)
 
-        logger.info("Done (local). Output path: %s", output_path)
+        logger.info("Writing full GPKG to %s", full_gpkg_path)
+        gdf_full.to_file(full_gpkg_path, driver="GPKG")
 
-    logger.info("Done. Output rows: %d", len(gdf_out))
+        logger.info("Writing full GeoParquet to %s", full_geopq_path)
+        gdf_full.to_parquet(full_geopq_path, index=False)
+
+        logger.info("Writing edges GeoParquet to %s", edges_path)
+        edges_gdf.to_parquet(edges_path, index=False)
+
+        logger.info("Writing flows table Parquet to %s", flows_path)
+        flows_table.to_parquet(flows_path, index=False)
+
+        logger.info(
+            "Done (local). Outputs written to %s: {%s, %s, %s, %s}",
+            out_dir_root,
+            full_gpkg_name,
+            full_geopq_name,
+            edges_name,
+            flows_name,
+        )
+
+    logger.info("Done. Full output rows: %d, edges: %d, flows rows: %d",
+                len(gdf_full), len(edges_gdf), len(flows_table))
 
 
 if __name__ == "__main__":
