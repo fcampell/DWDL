@@ -1,15 +1,29 @@
 #!/usr/bin/env python
 """
-Traffic flow simulation for Zürich – from raw counting stations to edge flows.
+Traffic flow simulation for Zürich – from partitioned Parquet counting stations to edge×hour flows.
 
-This script is a batch version of your notebook:
-- Loads SID traffic counts (sid_dav_verkehrszaehlung_miv_od2031_2025.csv)
-- Transforms LV95 coordinates to WGS84
-- Infers directions ("in", "out", label-based bearings)
-- Snaps stations to OSM street network (Zürich, drive)
-- Propagates flows along the network with distance decay & direction weights
-- Aggregates flows per road segment (OSM edge)
-- Writes one output file (GPKG or Parquet)
+Changes compared to the original:
+- Input is Parquet instead of CSV.
+- Input is partitioned into many files in a folder.
+  You provide:
+    * INPUT_PREFIX : folder/prefix containing Parquet files
+    * INPUT_FILTER : substring that must be contained in each relevant filename
+  The script loads all matching Parquet files and concatenates them.
+
+- Temporal granularity:
+  We aggregate to a typical day profile:
+      (MSID, Richtung, hour)
+  where hour = MessungDatZeit.dt.hour ∈ {0, …, 23}.
+  So the final result is per edge and per hour of day (no date dimension).
+
+- Outputs:
+  A single OUTPUT_KEY defines the *output folder* / S3 prefix.
+  The script always writes 4 files:
+
+  1) Full edge×hour flows with geometry (GeoPackage)
+  2) Full edge×hour flows with geometry (GeoParquet)
+  3) Normalized edges-only geometry (GeoParquet)
+  4) Normalized flows table (no geometry, Parquet)
 
 Environment variables
 ---------------------
@@ -17,27 +31,33 @@ Environment variables
 I/O mode (local vs S3)
 ~~~~~~~~~~~~~~~~~~~~~~
 If all of these are set, we run in S3 mode:
-- INPUT_BUCKET      : S3 bucket for input CSV
-- INPUT_KEY         : S3 key for input CSV
-- OUTPUT_BUCKET     : S3 bucket for output file
-- OUTPUT_KEY        : S3 key for output file
+- INPUT_BUCKET      : S3 bucket for input Parquet files
+- INPUT_PREFIX      : S3 prefix/folder where the Parquet files live
+                      e.g. "bronze/traffic_2025"
+- INPUT_FILTER      : substring to select the relevant Parquet files
+                      (e.g. "sid_dav_verkehrszaehlung_miv_od2031_2025")
+- OUTPUT_BUCKET     : S3 bucket for outputs
+- OUTPUT_KEY        : S3 prefix/folder for outputs
+                      e.g. "silver/traffic_edge_flows"
 
 Otherwise, we run in local mode:
 - LOCAL_BUCKET_ROOT : root folder inside container (default: "/data")
-- INPUT_KEY         : path to CSV relative to LOCAL_BUCKET_ROOT
-                      e.g. "bronze/sid_dav_verkehrszaehlung_miv_od2031_2025.csv"
-- OUTPUT_KEY        : path for output relative to LOCAL_BUCKET_ROOT
-                      e.g. "silver/traffic_edge_flows.gpkg"
+- INPUT_PREFIX      : folder under LOCAL_BUCKET_ROOT containing Parquet files
+                      e.g. "bronze/traffic_2025"
+- INPUT_FILTER      : substring to select relevant Parquet files
+- OUTPUT_KEY        : output folder under LOCAL_BUCKET_ROOT
+                      e.g. "silver/traffic_edge_flows"
+
+The 4 output files will then be:
+
+  <LOCAL_BUCKET_ROOT>/<OUTPUT_KEY>/traffic_edge_flows_full.gpkg
+  <LOCAL_BUCKET_ROOT>/<OUTPUT_KEY>/traffic_edge_flows_full.parquet
+  <LOCAL_BUCKET_ROOT>/<OUTPUT_KEY>/traffic_edge_flows_edges.parquet
+  <LOCAL_BUCKET_ROOT>/<OUTPUT_KEY>/traffic_edge_flows_table.parquet
 
 Other config
 ~~~~~~~~~~~~
-- OUTPUT_FORMAT     : "gpkg" (default) or "parquet"
 - LOG_LEVEL         : "INFO" (default), "DEBUG", ...
-
-Traffic CSV
-~~~~~~~~~~~
-- TRAFFIC_CSV_FILE  : optional override for file name if INPUT_KEY is not set.
-                      default: "sid_dav_verkehrszaehlung_miv_od2031_2025.csv"
 
 OSM / propagation parameters (optional)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -54,9 +74,9 @@ Typical local run
 docker run --rm \
   -v "$(pwd)/local_bucket:/data" \
   -e LOCAL_BUCKET_ROOT=/data \
-  -e INPUT_KEY="bronze/sid_dav_verkehrszaehlung_miv_od2031_2025.csv" \
-  -e OUTPUT_KEY="silver/traffic_edge_flows.gpkg" \
-  -e OUTPUT_FORMAT="gpkg" \
+  -e INPUT_PREFIX="bronze/traffic_2025" \
+  -e INPUT_FILTER="sid_dav_verkehrszaehlung_miv_od2031_2025" \
+  -e OUTPUT_KEY="silver/traffic_edge_flows" \
   traffic-flow:latest
 """
 
@@ -126,7 +146,6 @@ def classify_direction(x: str) -> str:
         return "label"
 
 
-# Full Zurich heuristic mapping as in notebook
 label_bearings = {
     # Norden / Nordosten
     "oerlikon": 45, "affoltern": 45, "schwamendingen": 45,
@@ -181,7 +200,6 @@ def get_label_bearing(label: str):
     if pd.isna(label):
         return None
     label = str(label).lower().strip()
-    # Umlaut handling
     label = label.replace("ö", "oe").replace("ü", "ue").replace("ä", "ae")
     for key, bearing in label_bearings.items():
         if key in label:
@@ -202,7 +220,7 @@ def bearing_to_center(lon: float, lat: float) -> float:
     return angle
 
 
-def bearing_from_type(row: pd.Series) -> float | None:
+def bearing_from_type(row: pd.Series):
     """Heuristic bearing depending on Richtung_typ."""
     lon = row["lon"]
     lat = row["lat"]
@@ -244,61 +262,84 @@ def damp_flow(flow_value: float, distance_m: float, decay_factor: float) -> floa
 
 
 # -------------------------------------------------------------------
-# I/O helpers
+# I/O helpers for Parquet
 # -------------------------------------------------------------------
-def load_csv_local(root: str, rel_path: str) -> pd.DataFrame:
-    path = os.path.join(root, rel_path)
-    logger.info("Reading local CSV: %s", path)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Input file not found: {path}")
-    return pd.read_csv(path, sep=",", dtype=str)
+def load_parquet_folder_local(root: str, rel_folder: str, name_filter: str) -> pd.DataFrame:
+    folder = os.path.join(root, rel_folder)
+    logger.info("Reading local Parquet folder: %s (filter=%r)", folder, name_filter)
+    if not os.path.isdir(folder):
+        raise FileNotFoundError(f"Input folder not found: {folder}")
+
+    files = [
+        f for f in os.listdir(folder)
+        if f.endswith(".parquet") and (name_filter in f if name_filter else True)
+    ]
+
+    if not files:
+        raise FileNotFoundError(
+            f"No Parquet files matching filter={name_filter!r} in {folder}"
+        )
+
+    dfs = []
+    for f in files:
+        path = os.path.join(folder, f)
+        logger.info("  -> reading %s", path)
+        dfs.append(pd.read_parquet(path))
+
+    df = pd.concat(dfs, ignore_index=True)
+    logger.info("Concatenated %d files into %d rows", len(files), len(df))
+    return df
 
 
-def load_csv_s3(bucket: str, key: str) -> pd.DataFrame:
-    logger.info("Reading CSV from s3://%s/%s", bucket, key)
+def load_parquet_folder_s3(bucket: str, prefix: str, name_filter: str) -> pd.DataFrame:
+    logger.info("Reading Parquet from s3://%s/%s* (filter=%r)", bucket, prefix, name_filter)
     s3 = boto3.client("s3")
-    with tempfile.NamedTemporaryFile(suffix=".csv") as tmp:
-        s3.download_fileobj(bucket, key, tmp)
-        tmp.flush()
-        tmp.seek(0)
-        return pd.read_csv(tmp.name, sep=",", dtype=str)
+
+    if prefix and not prefix.endswith("/"):
+        prefix = prefix + "/"
+
+    paginator = s3.get_paginator("list_objects_v2")
+    page_iter = paginator.paginate(Bucket=bucket, Prefix=prefix)
+
+    keys = []
+    for page in page_iter:
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if not key.endswith(".parquet"):
+                continue
+            fname = os.path.basename(key)
+            if name_filter and name_filter not in fname:
+                continue
+            keys.append(key)
+
+    if not keys:
+        raise FileNotFoundError(
+            f"No Parquet objects matching filter={name_filter!r} under s3://{bucket}/{prefix}"
+        )
+
+    dfs = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for key in keys:
+            tmp_path = os.path.join(tmpdir, os.path.basename(key))
+            logger.info("  -> downloading s3://%s/%s to %s", bucket, key, tmp_path)
+            with open(tmp_path, "wb") as f:
+                s3.download_fileobj(bucket, key, f)
+            dfs.append(pd.read_parquet(tmp_path))
+
+    df = pd.concat(dfs, ignore_index=True)
+    logger.info("Concatenated %d objects into %d rows", len(keys), len(df))
+    return df
 
 
-def save_geodataframe(gdf: gpd.GeoDataFrame,
-                      output_format: str,
-                      local_root: str | None,
-                      output_path_or_key: str,
-                      use_s3: bool,
-                      output_bucket: str | None):
-    """Save GeoDataFrame either locally or to S3 as one file."""
-    if use_s3:
-        assert output_bucket is not None
-        s3 = boto3.client("s3")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            if output_format == "gpkg":
-                tmp_name = "traffic_edge_flows.gpkg"
-                tmp_path = os.path.join(tmpdir, tmp_name)
-                gdf.to_file(tmp_path, driver="GPKG")
-            else:
-                tmp_name = "traffic_edge_flows.parquet"
-                tmp_path = os.path.join(tmpdir, tmp_name)
-                gdf.to_parquet(tmp_path, index=False)
-
-            size_bytes = os.path.getsize(tmp_path)
-            logger.info("Temporary output %s (size=%d bytes)", tmp_path, size_bytes)
-            s3.upload_file(tmp_path, output_bucket, output_path_or_key)
-        logger.info("Uploaded output to s3://%s/%s", output_bucket, output_path_or_key)
-    else:
-        assert local_root is not None
-        out_path = os.path.join(local_root, output_path_or_key)
-        out_dir = os.path.dirname(out_path)
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-        if output_format == "gpkg":
-            gdf.to_file(out_path, driver="GPKG")
-        else:
-            gdf.to_parquet(out_path, index=False)
-        logger.info("Output written locally to %s", out_path)
+def cast_object_columns_to_str(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert all object dtype columns to string, to make Parquet writing safe.
+    Geometry columns (GeoSeries) are not affected.
+    """
+    obj_cols = df.select_dtypes(include=["object"]).columns
+    for col in obj_cols:
+        df[col] = df[col].astype("string")
+    return df
 
 
 # -------------------------------------------------------------------
@@ -309,43 +350,30 @@ def main():
     # I/O configuration
     # --------------------------------------------------------------
     input_bucket = os.getenv("INPUT_BUCKET")
-    input_key = os.getenv("INPUT_KEY")
+    input_prefix = os.getenv("INPUT_PREFIX", "").strip()
+    input_filter = os.getenv("INPUT_FILTER", "").strip()
     output_bucket = os.getenv("OUTPUT_BUCKET")
-    output_key = os.getenv("OUTPUT_KEY")
+    output_key = os.getenv("OUTPUT_KEY", "").strip()
 
     local_root = os.getenv("LOCAL_BUCKET_ROOT", "/data")
-    traffic_default_name = os.getenv(
-        "TRAFFIC_CSV_FILE", "sid_dav_verkehrszaehlung_miv_od2031_2025.csv"
-    )
 
-    use_s3 = all([input_bucket, input_key, output_bucket, output_key])
+    use_s3 = all([input_bucket, input_prefix, output_bucket, output_key])
 
     if not output_key:
-        output_key = "traffic_edge_flows.gpkg"
-
-    if not input_key:
-        input_key = traffic_default_name
-
-    output_format_raw = os.getenv("OUTPUT_FORMAT", "gpkg").strip().lower()
-    if output_format_raw in ("gpkg", "geopackage"):
-        output_format = "gpkg"
-    elif output_format_raw in ("parquet", "geoparquet"):
-        output_format = "parquet"
-    else:
-        logger.warning("Unknown OUTPUT_FORMAT=%r, defaulting to 'gpkg'", output_format_raw)
-        output_format = "gpkg"
+        output_key = "traffic_edge_flows"
 
     if use_s3:
         logger.info("Running in S3 mode.")
-        logger.info("Input:  s3://%s/%s", input_bucket, input_key)
-        logger.info("Output: s3://%s/%s", output_bucket, output_key)
+        logger.info("Input:  s3://%s/%s (filter=%r)", input_bucket, input_prefix, input_filter)
+        logger.info("Output prefix: s3://%s/%s", output_bucket, output_key)
+        out_dir_root = None
     else:
         logger.info("Running in local mode.")
         logger.info("Local root: %s", local_root)
-        logger.info("Input:  %s", os.path.join(local_root, input_key))
-        logger.info("Output: %s", os.path.join(local_root, output_key))
-
-    logger.info("Output format: %s", output_format)
+        logger.info("Input folder: %s", os.path.join(local_root, input_prefix))
+        logger.info("Input filter: %r", input_filter)
+        out_dir_root = os.path.join(local_root, output_key)
+        logger.info("Output folder: %s", out_dir_root)
 
     # --------------------------------------------------------------
     # Propagation parameters
@@ -364,7 +392,7 @@ def main():
                 max_bearing_diff, min_edge_share)
 
     # --------------------------------------------------------------
-    # 1. Load traffic CSV
+    # 1. Load traffic Parquet (partitioned folder)
     # --------------------------------------------------------------
     cols = [
         "MSID", "MSName", "ZSID", "ZSName",
@@ -374,13 +402,13 @@ def main():
     ]
 
     if use_s3:
-        df = load_csv_s3(input_bucket, input_key)
+        df = load_parquet_folder_s3(input_bucket, input_prefix, input_filter)
     else:
-        df = load_csv_local(local_root, input_key)
+        df = load_parquet_folder_local(local_root, input_prefix, input_filter)
 
-    # Restrict to relevant columns (if loaded extra)
+    # Restrict to relevant columns if present
     df = df[[c for c in df.columns if c in cols]].copy()
-    logger.info("Loaded CSV with %d rows and %d columns", len(df), len(df.columns))
+    logger.info("Loaded Parquet with %d rows and %d columns", len(df), len(df.columns))
 
     # Types
     df["AnzFahrzeuge"] = pd.to_numeric(df["AnzFahrzeuge"], errors="coerce")
@@ -389,6 +417,13 @@ def main():
     df["NKoord"] = pd.to_numeric(df["NKoord"], errors="coerce")
 
     logger.info("After type conversion:\n%s", df.dtypes)
+
+    # Drop rows without valid timestamp or coordinates
+    df = df.dropna(subset=["MessungDatZeit", "EKoord", "NKoord"]).copy()
+    logger.info("After dropping invalid rows: %d", len(df))
+
+    # Hour-of-day (0–23)
+    df["hour"] = df["MessungDatZeit"].dt.hour.astype("Int64")
 
     # --------------------------------------------------------------
     # 2. LV95 -> WGS84 & build stations GeoDataFrame
@@ -411,19 +446,19 @@ def main():
     )
 
     # --------------------------------------------------------------
-    # 3. Aggregate mean flow per station + direction
+    # 3. Aggregate flow per station + direction + HOUR of day
     # --------------------------------------------------------------
     agg = (
         gdf
-        .groupby(["MSID", "Richtung"], as_index=False)
+        .groupby(["MSID", "Richtung", "hour"], as_index=False)
         .agg({
-            "AnzFahrzeuge": "mean",
+            "AnzFahrzeuge": "mean",   # typical hourly flow over all days
             "lon": "first",
             "lat": "first",
             "MSName": "first",
             "Achse": "first",
         })
-        .rename(columns={"AnzFahrzeuge": "flow_mean"})
+        .rename(columns={"AnzFahrzeuge": "flow_value"})
     )
 
     gdf_stations = gpd.GeoDataFrame(
@@ -432,7 +467,7 @@ def main():
         crs="EPSG:4326",
     )
 
-    logger.info("Number of aggregated station directions: %d", len(gdf_stations))
+    logger.info("Number of station×direction×hour seeds: %d", len(gdf_stations))
 
     # Richtung_typ classification
     gdf_stations["Richtung_typ"] = gdf_stations["Richtung"].apply(classify_direction)
@@ -442,6 +477,7 @@ def main():
     # 4. Seed bearings
     # --------------------------------------------------------------
     gdf_stations["bearing_seed"] = gdf_stations.apply(bearing_from_type, axis=1)
+
     # For seeds still missing, fallback to label-based
     mask_missing = gdf_stations["bearing_seed"].isna()
     gdf_stations.loc[mask_missing, "bearing_seed"] = (
@@ -479,7 +515,6 @@ def main():
     logger.info("Computing nearest edges for %d seeds ...", len(gdf_stations))
     edges_arr, dists_arr = ox.distance.nearest_edges(G, X=xs, Y=ys, return_dist=True)
 
-    # edges_arr is a list/array of (u, v, key) tuples
     gdf_stations["edge_u"] = [t[0] for t in edges_arr]
     gdf_stations["edge_v"] = [t[1] for t in edges_arr]
     gdf_stations["edge_k"] = [t[2] for t in edges_arr]
@@ -500,23 +535,23 @@ def main():
         edge_data = G.get_edge_data(u, v, k) or {}
         edge_bearing = float(edge_data.get("bearing", 180.0))
         if bearing_diff(seed_bearing, edge_bearing) > 90.0:
-            # flip
             start_nodes.append(v)
         else:
             start_nodes.append(u)
 
     gdf_stations["start_node"] = start_nodes
 
-    # Seeds GeoDataFrame for propagation (just what we need)
+    # Seeds GeoDataFrame for propagation (only what we need)
     gdf_seeds = gpd.GeoDataFrame(
         gdf_stations[
             [
                 "MSID",
                 "Richtung",
                 "Richtung_typ",
-                "flow_mean",
+                "flow_value",
                 "bearing_seed",
                 "start_node",
+                "hour",
             ]
         ].copy(),
         geometry=gdf_stations.geometry,
@@ -526,9 +561,9 @@ def main():
     logger.info("Final seeds to propagate: %d", len(gdf_seeds))
 
     # --------------------------------------------------------------
-    # 7. Propagate flows along OSM graph
+    # 7. Propagate flows along OSM graph (edge×hour)
     # --------------------------------------------------------------
-    flows_dir_records: list[dict] = []
+    flows_dir_records = []
 
     logger.info("Starting flow propagation for %d seeds ...", len(gdf_seeds))
     for idx, seed in gdf_seeds.iterrows():
@@ -536,8 +571,9 @@ def main():
             logger.info("  Processed %d seeds ...", idx)
 
         seed_node = seed["start_node"]
-        start_flow = float(seed["flow_mean"])
+        start_flow = float(seed["flow_value"])
         seed_bearing = float(seed["bearing_seed"])
+        hour = int(seed["hour"])
 
         # Dijkstra from seed_node up to MAX_DISTANCE_M
         lengths = nx.single_source_dijkstra_path_length(
@@ -573,6 +609,7 @@ def main():
                         "bearing_seed": seed_bearing,
                         "bearing_edge": edge_bearing,
                         "weight": w,
+                        "hour": hour,
                     }
                 )
 
@@ -583,79 +620,205 @@ def main():
     )
 
     if df_flows_dir.empty:
-        logger.warning("No flows generated; output will have zero total_flow.")
-        # Still build edges GeoDataFrame with zero flows.
+        logger.warning("No flows generated; outputs will contain zero flows.")
 
     # --------------------------------------------------------------
-    # 8. Aggregate flows per OSM edge
+    # 8. Aggregate flows per OSM edge × HOUR
     # --------------------------------------------------------------
     if not df_flows_dir.empty:
         df_edge_flow = (
-            df_flows_dir.groupby(["u", "v", "key"], as_index=False)
+            df_flows_dir.groupby(["u", "v", "key", "hour"], as_index=False)
             .agg(
                 total_flow=("flow_value", "sum"),
                 n_sources=("MSID", "nunique"),
             )
         )
         logger.info(
-            "Aggregated flows for %d unique edges.",
+            "Aggregated flows for %d edge×hour combinations.",
             len(df_edge_flow),
         )
     else:
-        df_edge_flow = pd.DataFrame(columns=["u", "v", "key", "total_flow", "n_sources"])
+        df_edge_flow = pd.DataFrame(
+            columns=["u", "v", "key", "hour", "total_flow", "n_sources"]
+        )
 
     # --------------------------------------------------------------
-    # 9. Build edge GeoDataFrame from graph and join flows
+    # 9. Build edge GeoDataFrame and join flows
     # --------------------------------------------------------------
     edges_gdf = ox.graph_to_gdfs(G, nodes=False, edges=True)
     edges_gdf = edges_gdf.reset_index()[["u", "v", "key", "geometry", "name", "length", "bearing"]]
 
     # Ensure types match
-    df_edge_flow["u"] = df_edge_flow["u"].astype(edges_gdf["u"].dtype, errors="ignore")
-    df_edge_flow["v"] = df_edge_flow["v"].astype(edges_gdf["v"].dtype, errors="ignore")
+    if not df_edge_flow.empty:
+        df_edge_flow["u"] = df_edge_flow["u"].astype(edges_gdf["u"].dtype, errors="ignore")
+        df_edge_flow["v"] = df_edge_flow["v"].astype(edges_gdf["v"].dtype, errors="ignore")
 
-    edges_gdf = edges_gdf.merge(
-        df_edge_flow,
+    # Full geodata (edge × hour)
+    gdf_full = df_edge_flow.merge(
+        edges_gdf,
         how="left",
         on=["u", "v", "key"],
     )
 
-    edges_gdf["total_flow"] = edges_gdf["total_flow"].fillna(0.0)
-    edges_gdf["n_sources"] = edges_gdf["n_sources"].fillna(0).astype(int)
+    # Reorder columns a bit
+    if not gdf_full.empty:
+        cols_front = [
+            "u", "v", "key", "hour",
+            "total_flow", "n_sources",
+            "name", "length", "bearing",
+            "geometry",
+        ]
+        gdf_full = gdf_full[[c for c in cols_front if c in gdf_full.columns] +
+                            [c for c in gdf_full.columns if c not in cols_front]]
 
-    max_flow = edges_gdf["total_flow"].max()
-    if max_flow > 0:
-        edges_gdf["flow_norm"] = edges_gdf["total_flow"] / max_flow
+    # Fill NaNs
+    if "total_flow" in gdf_full.columns:
+        gdf_full["total_flow"] = gdf_full["total_flow"].fillna(0.0)
+    if "n_sources" in gdf_full.columns:
+        gdf_full["n_sources"] = gdf_full["n_sources"].fillna(0).astype(int)
+
+    # Normalized flow per hour
+    def _norm_group(x: pd.Series) -> pd.Series:
+        m = x.max()
+        if m > 0:
+            return x / m
+        else:
+            return 0.0
+
+    if not gdf_full.empty and "total_flow" in gdf_full.columns:
+        gdf_full["flow_norm"] = (
+            gdf_full.groupby("hour")["total_flow"].transform(_norm_group)
+        )
     else:
-        edges_gdf["flow_norm"] = 0.0
+        gdf_full["flow_norm"] = 0.0
 
     # --------------------------------------------------------------
-    # 9b. Reproject to LV95 (EPSG:2056) for output
+    # 9b. Reproject to LV95 (EPSG:2056) for geodata outputs
     # --------------------------------------------------------------
     target_crs = "EPSG:2056"
-    gdf_edges = gpd.GeoDataFrame(edges_gdf, geometry="geometry", crs="EPSG:4326")
-    gdf_edges = gdf_edges.to_crs(target_crs)
+
+    if not gdf_full.empty:
+        gdf_full = gpd.GeoDataFrame(gdf_full, geometry="geometry", crs="EPSG:4326")
+        gdf_full = gdf_full.to_crs(target_crs)
+
+    # Edges-only geometry (normalized)
+    edges_geom = edges_gdf.drop_duplicates(subset=["u", "v", "key"])[
+        ["u", "v", "key", "geometry", "name", "length", "bearing"]
+    ]
+
+    edges_geom = gpd.GeoDataFrame(
+        edges_geom,
+        geometry="geometry",
+        crs="EPSG:4326",
+    ).to_crs(target_crs)
 
     logger.info(
-        "Edges with total_flow > 0: %d / %d (CRS=%s)",
-        int((gdf_edges["total_flow"] > 0).sum()),
-        len(gdf_edges),
-        target_crs,
+        "Full edge×hour rows: %d, edges geometry rows: %d",
+        len(gdf_full),
+        len(edges_geom),
     )
 
-    # --------------------------------------------------------------
-    # 10. Save output
-    # --------------------------------------------------------------
-    save_geodataframe(
-        gdf_edges,
-        output_format=output_format,
-        local_root=None if use_s3 else local_root,
-        output_path_or_key=output_key,
-        use_s3=use_s3,
-        output_bucket=output_bucket,
-    )
+    # Flows table (no geometry)
+    flows_table = gdf_full.drop(columns=["geometry"]).copy()
 
-    logger.info("Done. Output rows: %d", len(gdf_edges))
+    # --------------------------------------------------------------
+    # 10. Save 4 outputs
+    # --------------------------------------------------------------
+    full_gpkg_name = "traffic_edge_flows_full.gpkg"
+    full_geopq_name = "traffic_edge_flows_full.parquet"
+    edges_name = "traffic_edge_flows_edges.parquet"
+    flows_name = "traffic_edge_flows_table.parquet"
+
+    if use_s3:
+        s3 = boto3.client("s3")
+        prefix = output_key.rstrip("/")
+
+        logger.info("Writing 4 outputs to s3://%s/%s/ ...", output_bucket, prefix)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Full GPKG
+            full_gpkg_path = os.path.join(tmpdir, full_gpkg_name)
+            gdf_full.to_file(full_gpkg_path, driver="GPKG")
+
+            # Prepare safe copies for Parquet (cast object -> string)
+            gdf_full_pq = cast_object_columns_to_str(gdf_full.copy())
+            edges_geom_pq = cast_object_columns_to_str(edges_geom.copy())
+            flows_table_pq = cast_object_columns_to_str(flows_table.copy())
+
+            # Full GeoParquet
+            full_geopq_path = os.path.join(tmpdir, full_geopq_name)
+            gdf_full_pq.to_parquet(full_geopq_path, index=False)
+
+            # Edges GeoParquet
+            edges_path = os.path.join(tmpdir, edges_name)
+            edges_geom_pq.to_parquet(edges_path, index=False)
+
+            # Flows table Parquet
+            flows_path = os.path.join(tmpdir, flows_name)
+            flows_table_pq.to_parquet(flows_path, index=False)
+
+
+            def _upload(local_path: str, name: str):
+                key = f"{prefix}/{name}"
+                size_bytes = os.path.getsize(local_path)
+                logger.info(
+                    "Uploading %s (%d bytes) to s3://%s/%s",
+                    name, size_bytes, output_bucket, key
+                )
+                s3.upload_file(local_path, output_bucket, key)
+
+            _upload(full_gpkg_path, full_gpkg_name)
+            _upload(full_geopq_path, full_geopq_name)
+            _upload(edges_path, edges_name)
+            _upload(flows_path, flows_name)
+
+        logger.info(
+            "Uploaded 4 outputs to s3://%s/%s/{%s, %s, %s, %s}",
+            output_bucket,
+            prefix,
+            full_gpkg_name,
+            full_geopq_name,
+            edges_name,
+            flows_name,
+        )
+
+    else:
+        os.makedirs(out_dir_root, exist_ok=True)
+
+        full_gpkg_path = os.path.join(out_dir_root, full_gpkg_name)
+        full_geopq_path = os.path.join(out_dir_root, full_geopq_name)
+        edges_path = os.path.join(out_dir_root, edges_name)
+        flows_path = os.path.join(out_dir_root, flows_name)
+
+        logger.info("Writing full GPKG to %s", full_gpkg_path)
+        gdf_full.to_file(full_gpkg_path, driver="GPKG")
+
+        # Prepare safe copies for Parquet
+        gdf_full_pq = cast_object_columns_to_str(gdf_full.copy())
+        edges_geom_pq = cast_object_columns_to_str(edges_geom.copy())
+        flows_table_pq = cast_object_columns_to_str(flows_table.copy())
+
+        logger.info("Writing full GeoParquet to %s", full_geopq_path)
+        gdf_full_pq.to_parquet(full_geopq_path, index=False)
+
+        logger.info("Writing edges GeoParquet to %s", edges_path)
+        edges_geom_pq.to_parquet(edges_path, index=False)
+
+        logger.info("Writing flows table Parquet to %s", flows_path)
+        flows_table_pq.to_parquet(flows_path, index=False)
+
+
+        logger.info(
+            "Done (local). Outputs written to %s: {%s, %s, %s, %s}",
+            out_dir_root,
+            full_gpkg_name,
+            full_geopq_name,
+            edges_name,
+            flows_name,
+        )
+
+    logger.info("Done. Full rows: %d, edges: %d, flows table rows: %d",
+                len(gdf_full), len(edges_geom), len(flows_table))
 
 
 if __name__ == "__main__":
