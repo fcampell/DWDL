@@ -68,14 +68,20 @@ OUTPUT_KEY="gold/zurich_vbz_flows" \
 OUTPUT_LEVEL=daily \
 python run_vbz_flows_model.py
 
-Typical S3/ECS run:
+ECS configuration:
 -------------------
-INPUT_BUCKET=your-bucket \
-INPUT_PREFIX="silver/public_transport_vbz" \
-OUTPUT_BUCKET=your-bucket \
-OUTPUT_KEY="gold/zurich_vbz_flows" \
-OUTPUT_LEVEL=daily \
-python run_vbz_flows_model.py
+INPUT_BUCKET=facade-project-dev
+INPUT_PREFIX=silver/public_transport_vbz
+VERSION_TAG=V1
+OUTPUT_BUCKET=facade-project-dev
+OUTPUT_KEY=gold/zurich_vbz_flows/2025
+OUTPUT_LEVEL=hourly
+
+VBZ_REISENDE_FILE      = 2025/public_transport_vbz_2025.parquet
+VBZ_TAGTYP_FILE        = reference/tagtyp.parquet
+VBZ_HALTESTELLEN_FILE  = reference/haltestellen.parquet
+VBZ_LINIE_FILE         = reference/linie.parquet
+
 """
 
 import os
@@ -164,6 +170,7 @@ def main():
     input_prefix = os.getenv("INPUT_PREFIX", "").strip()
     output_bucket = os.getenv("OUTPUT_BUCKET")
     output_key = os.getenv("OUTPUT_KEY", "").strip()
+    version_tag = os.getenv("VERSION_TAG", "").strip()
 
     use_s3 = all([input_bucket, input_prefix, output_bucket, output_key])
 
@@ -530,10 +537,10 @@ def main():
     logger.info("Preparing 4 outputs (full GPKG, full GeoParquet, edges GeoParquet, flows table Parquet)...")
 
     # Filenames (no paths; we add folder/prefix below)
-    full_gpkg_name = f"vbz_flows_{output_level}.gpkg"
-    full_geopq_name = f"vbz_flows_{output_level}.parquet"
-    edges_name = "vbz_flows_edges.parquet"
-    flows_name = f"vbz_flows_{output_level}_table.parquet"
+    full_gpkg_name = f"{version_tag}_vbz_flows_{output_level}.gpkg"
+    full_geopq_name = f"{version_tag}_vbz_flows_{output_level}.parquet"
+    edges_name = f"{version_tag}_vbz_edges.parquet"
+    flows_name = f"{version_tag}_vbz_flows_{output_level}_flows_table.parquet"
 
     # -------------------------------
     # Save outputs

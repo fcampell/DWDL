@@ -20,4 +20,5 @@ docker run --rm \
   -e INPUT_PREFIX="silver/motorized_traffic/2025" \
   -e INPUT_FILTER="motorized_traffic" \
   -e OUTPUT_KEY="gold/motorized_traffic/2025" \
+  -e VERSION_TAG="2025" \
   traffic-flow:latest

@@ -19,7 +19,7 @@ I/O mode (local vs S3)
 ~~~~~~~~~~~~~~~~~~~~~~
 If all of these are set, we run in S3 mode:
 - INPUT_BUCKET          : S3 bucket for input Parquet files
-- OUTPUT_BUCKET         : S3 bucket for outputs
+- OUTPUT_BUCKET         : S3 bucket for outputs (bucket *name only*!)
 
 You can then choose between:
   Single-file mode:
@@ -30,10 +30,21 @@ You can then choose between:
     - INPUT_FILENAME_SUBSTR (optional) : substring that must be in filename
                                          (default: "pedestrian")
 
+Output prefix in S3:
+- OUTPUT_KEY            : S3 prefix / "folder" inside OUTPUT_BUCKET
+                          Example: "gold/pedestrian_bicycle/2025"
+                          The script will write:
+                            s3://OUTPUT_BUCKET/OUTPUT_KEY/<VERSION_TAG>_bike_edges.gpkg
+                            s3://OUTPUT_BUCKET/OUTPUT_KEY/<VERSION_TAG>_bike_edges.parquet
+                            s3://OUTPUT_BUCKET/OUTPUT_KEY/<VERSION_TAG>_bike_flows.parquet
+                            s3://OUTPUT_BUCKET/OUTPUT_KEY/<VERSION_TAG>_ped_edges.gpkg
+                            s3://OUTPUT_BUCKET/OUTPUT_KEY/<VERSION_TAG>_ped_edges.parquet
+                            s3://OUTPUT_BUCKET/OUTPUT_KEY/<VERSION_TAG>_ped_flows.parquet
+
 Otherwise, we run in local mode:
 - LOCAL_BUCKET_ROOT     : root folder inside container (default: "/data")
 
-Input choice:
+Input choice (local):
   Single-file mode:
     - INPUT_KEY         : Parquet file relative to LOCAL_BUCKET_ROOT
 
@@ -47,27 +58,38 @@ If neither INPUT_DIR/INPUT_PREFIX nor INPUT_KEY is set, we fall back to:
 
 Outputs
 ~~~~~~~
-Per mode (bike & pedestrian) we now write **only normalized outputs**:
+Per mode (bike & pedestrian) we write **only normalized outputs**:
 
 Bike:
   1) Normalized edges (GeoPackage, geometries only, one row per edge, CRS=EPSG:2056):
-       - <base>_bike_edges.gpkg    (S3) or bike_edges.gpkg (local)
+       - S3   : s3://OUTPUT_BUCKET/OUTPUT_KEY/<VERSION_TAG>_bike_edges.gpkg
+       - Local: LOCAL_BUCKET_ROOT/OUTPUT_DIR/<VERSION_TAG>_bike_edges.gpkg
   2) Normalized edges (GeoParquet, geometries only, one row per edge, CRS=EPSG:2056):
-       - <base>_bike_edges.parquet or bike_edges.parquet
+       - .../<VERSION_TAG>_bike_edges.parquet
   3) Normalized flows (Parquet, non-geo, edge × time):
-       - <base>_bike_flows.parquet or bike_flows.parquet
+       - .../<VERSION_TAG>_bike_flows.parquet
 
 Pedestrian: analogous with "ped_" names.
 
 Output base:
-- S3  : OUTPUT_PREFIX (e.g. "silver/zurich_pedbike_flows")
-- Local: OUTPUT_DIR under LOCAL_BUCKET_ROOT (e.g. "silver/zurich_pedbike_flows")
+- S3   : OUTPUT_BUCKET + OUTPUT_KEY (prefix inside bucket)
+- Local: LOCAL_BUCKET_ROOT + OUTPUT_DIR
 
 Other config
 ~~~~~~~~~~~~
-- LOG_LEVEL         : "INFO" (default), "DEBUG", ...
-- OSM_PLACE         : place name for OSMnx (default: "Zürich, Switzerland")
+- LOG_LEVEL             : "INFO" (default), "DEBUG", ...
+- OSM_PLACE             : place name for OSMnx (default: "Zürich, Switzerland")
 - INPUT_FILENAME_SUBSTR : default "pedestrian"
+- VERSION_TAG           : prefix used in all output filenames (recommended, e.g. "V1")
+
+Example – latest ECS config (S3 mode)
+-------------------------------------
+- INPUT_BUCKET=facade-project-dev
+- INPUT_PREFIX=silver/pedestrian_bicycle/2025
+- INPUT_FILENAME_SUBSTR=pedestrian_bicycle
+- OUTPUT_BUCKET=facade-project-dev
+- OUTPUT_KEY=gold/pedestrian_bicycle/2025
+- VERSION_TAG=V1
 
 Example – local, multi-file input
 ---------------------------------
@@ -77,6 +99,7 @@ docker run --rm \
   -e INPUT_DIR="bronze/pedbike_counts_2025" \
   -e INPUT_FILENAME_SUBSTR="pedestrian" \
   -e OUTPUT_DIR="silver/zurich_pedbike_flows" \
+  -e VERSION_TAG="V1" \
   pedbike-flows:latest
 """
 
@@ -625,8 +648,19 @@ def main():
     input_key = os.getenv("INPUT_KEY")
     input_prefix = os.getenv("INPUT_PREFIX")  # for S3 multi-file
     input_dir = os.getenv("INPUT_DIR")        # for local multi-file
+
+    # Clean separation for S3 outputs
     output_bucket = os.getenv("OUTPUT_BUCKET")
-    output_prefix = os.getenv("OUTPUT_PREFIX")
+    output_key = os.getenv("OUTPUT_KEY")  # prefix / folder path in the bucket
+    version_tag = os.getenv("VERSION_TAG", "").strip()
+
+    # Guard against putting a path into OUTPUT_BUCKET
+    if output_bucket and "/" in output_bucket:
+        raise ValueError(
+            f"OUTPUT_BUCKET={output_bucket!r} must be only the bucket name "
+            f"(e.g. 'facade-project-dev'), without any path. "
+            f"Use OUTPUT_KEY for the folder / prefix instead."
+        )
 
     local_root = os.getenv("LOCAL_BUCKET_ROOT", "/data")
     default_parquet_name = os.getenv(
@@ -638,9 +672,10 @@ def main():
     # Decide whether we are in S3 mode
     use_s3 = bool(input_bucket and output_bucket and (input_key or input_prefix))
 
-    # Base name for outputs
+    # Base prefix / dir for outputs
     if use_s3:
-        base_name = output_prefix or "pedbike_flows"
+        # S3: prefix inside the bucket, e.g. "gold/pedestrian_bicycle/2025"
+        base_prefix = (output_key or "pedbike_flows").rstrip("/")
         logger.info("Running in S3 mode.")
         if input_prefix:
             logger.info(
@@ -652,10 +687,13 @@ def main():
         else:
             effective_key = input_key or default_parquet_name
             logger.info("Input single file: s3://%s/%s", input_bucket, effective_key)
-        logger.info("Output base prefix: s3://%s/%s", output_bucket, base_name)
+
+        logger.info("Output base prefix: s3://%s/%s", output_bucket, base_prefix)
+
     else:
+        # Local: base dir under LOCAL_BUCKET_ROOT
         output_dir = os.getenv("OUTPUT_DIR", "pedbike_flows")
-        base_name = output_dir
+        base_prefix = output_dir  # used as directory name later
         logger.info("Running in local mode.")
         logger.info("Local root: %s", local_root)
 
@@ -887,7 +925,6 @@ def main():
             if seeds_t["VELO_DAY"].sum() <= 0:
                 continue
 
-            # existing per-timestep log (keep or drop, up to you)
             logger.info(
                 "Propagating bike flows (%d/%d) for %s ...",
                 i,
@@ -987,7 +1024,6 @@ def main():
                 total_ped,
             )
 
-
     df_ped_flows_all = pd.DataFrame(ped_flow_records)
     logger.info("Ped flow records (edge×time): %d", len(df_ped_flows_all))
 
@@ -1001,7 +1037,7 @@ def main():
         else:
             df_bike_flows_all["bike_flow_norm"] = 0.0
     else:
-        df_bike_flows_all["bike_flow_norm"] = []
+        df_bike_flows_all["bike_flow_norm"] = np.nan
 
     if not df_ped_flows_all.empty:
         max_ped_flow = df_ped_flows_all["ped_flow"].max()
@@ -1010,7 +1046,7 @@ def main():
         else:
             df_ped_flows_all["ped_flow_norm"] = 0.0
     else:
-        df_ped_flows_all["ped_flow_norm"] = []
+        df_ped_flows_all["ped_flow_norm"] = np.nan
 
     # --------------------------------------------------------------
     # 9. Build normalized edges (unique edges, no time)
@@ -1040,50 +1076,63 @@ def main():
     # --------------------------------------------------------------
     # 10. Save outputs – 3 files per type (edges GPKG, edges GeoParquet, flows Parquet)
     # --------------------------------------------------------------
-    def make_name(suffix: str) -> str:
-        # For S3, base_name is prefix; for local, it's dir name.
-        return f"{base_name.rstrip('/')}{suffix}"
+    def make_filename(stub: str) -> str:
+        """
+        Attach VERSION_TAG as prefix if provided.
+        Examples:
+          VERSION_TAG="V1", stub="bike_edges.gpkg" -> "V1_bike_edges.gpkg"
+          VERSION_TAG="",   stub="bike_edges.gpkg" -> "bike_edges.gpkg"
+        """
+        return f"{version_tag}_{stub}" if version_tag else stub
 
     if use_s3:
+        # S3: build full S3 keys as "<OUTPUT_KEY>/<filename>"
+        def s3_key(filename: str) -> str:
+            if base_prefix:
+                return f"{base_prefix}/{filename}"
+            return filename
+
         # Bike
         save_gdf_s3(
             gdf_bike_edges,
             bucket=output_bucket,
-            key=make_name("_bike_edges.gpkg"),
+            key=s3_key(make_filename("bike_edges.gpkg")),
             as_gpkg=True,
         )
         save_gdf_s3(
             gdf_bike_edges,
             bucket=output_bucket,
-            key=make_name("_bike_edges.parquet"),
+            key=s3_key(make_filename("bike_edges.parquet")),
             as_gpkg=False,
         )
         save_df_parquet_s3(
             df_bike_flows_all,
             bucket=output_bucket,
-            key=make_name("_bike_flows.parquet"),
+            key=s3_key(make_filename("bike_flows.parquet")),
         )
 
         # Ped
         save_gdf_s3(
             gdf_ped_edges,
             bucket=output_bucket,
-            key=make_name("_ped_edges.gpkg"),
+            key=s3_key(make_filename("ped_edges.gpkg")),
             as_gpkg=True,
         )
         save_gdf_s3(
             gdf_ped_edges,
             bucket=output_bucket,
-            key=make_name("_ped_edges.parquet"),
+            key=s3_key(make_filename("ped_edges.parquet")),
             as_gpkg=False,
         )
         save_df_parquet_s3(
             df_ped_flows_all,
             bucket=output_bucket,
-            key=make_name("_ped_flows.parquet"),
+            key=s3_key(make_filename("ped_flows.parquet")),
         )
+
     else:
-        output_dir = base_name
+        # Local: write into LOCAL_BUCKET_ROOT / OUTPUT_DIR
+        output_dir = base_prefix
         base_path = os.path.join(local_root, output_dir)
         os.makedirs(base_path, exist_ok=True)
 
@@ -1093,33 +1142,33 @@ def main():
         # Bike
         save_gdf_local(
             gdf_bike_edges,
-            path=local_path("bike_edges.gpkg"),
+            path=local_path(make_filename("bike_edges.gpkg")),
             as_gpkg=True,
         )
         save_gdf_local(
             gdf_bike_edges,
-            path=local_path("bike_edges.parquet"),
+            path=local_path(make_filename("bike_edges.parquet")),
             as_gpkg=False,
         )
         save_df_parquet_local(
             df_bike_flows_all,
-            path=local_path("bike_flows.parquet"),
+            path=local_path(make_filename("bike_flows.parquet")),
         )
 
         # Ped
         save_gdf_local(
             gdf_ped_edges,
-            path=local_path("ped_edges.gpkg"),
+            path=local_path(make_filename("ped_edges.gpkg")),
             as_gpkg=True,
         )
         save_gdf_local(
             gdf_ped_edges,
-            path=local_path("ped_edges.parquet"),
+            path=local_path(make_filename("ped_edges.parquet")),
             as_gpkg=False,
         )
         save_df_parquet_local(
             df_ped_flows_all,
-            path=local_path("ped_flows.parquet"),
+            path=local_path(make_filename("ped_flows.parquet")),
         )
 
     logger.info(

@@ -28,6 +28,7 @@ Changes compared to the original:
 Environment variables
 ---------------------
 
+
 I/O mode (local vs S3)
 ~~~~~~~~~~~~~~~~~~~~~~
 If all of these are set, we run in S3 mode:
@@ -68,6 +69,15 @@ OSM / propagation parameters (optional)
 - MIN_FLOW          : minimum propagated flow (default: 5)
 - MAX_BEARING_DIFF  : max allowed bearing difference in degrees (default: 135)
 - MIN_EDGE_SHARE    : minimum direction weight to keep edge (default: 0.01)
+
+
+latest configuration in ECS:
+- INPUT_BUCKET: facade-project-dev
+- INPUT_PREFIX: silver/motorized_traffic/2025
+- INPUT_FILTER: motorized
+- VERSION_TAG: V1
+- OUTPUT_BUCKET: facade-project-dev  
+- OUTPUT_KEY: gold/motorized_traffic
 
 Typical local run
 -----------------
@@ -354,6 +364,7 @@ def main():
     input_filter = os.getenv("INPUT_FILTER", "").strip()
     output_bucket = os.getenv("OUTPUT_BUCKET")
     output_key = os.getenv("OUTPUT_KEY", "").strip()
+    version_tag = os.getenv("VERSION_TAG", "").strip()
 
     local_root = os.getenv("LOCAL_BUCKET_ROOT", "/data")
 
@@ -724,10 +735,10 @@ def main():
     # --------------------------------------------------------------
     # 10. Save 4 outputs
     # --------------------------------------------------------------
-    full_gpkg_name = "traffic_edge_flows_full.gpkg"
-    full_geopq_name = "traffic_edge_flows_full.parquet"
-    edges_name = "traffic_edge_flows_edges.parquet"
-    flows_name = "traffic_edge_flows_table.parquet"
+    full_gpkg_name = f"{version_tag}_motorized_traffic_complete.gpkg"
+    full_geopq_name = f"{version_tag}_motorized_traffic_complete_full.parquet"
+    edges_name = f"{version_tag}_motorized_traffic_edges.parquet"
+    flows_name = f"{version_tag}_motorized_traffic_flows.parquet"
 
     if use_s3:
         s3 = boto3.client("s3")

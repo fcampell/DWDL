@@ -14,4 +14,5 @@ docker run --rm \
   -e INPUT_PREFIX="silver/public_transport_vbz" \
   -e OUTPUT_KEY="gold/vbz_flows" \
   -e OUTPUT_LEVEL="hourly" \
+  -e VERSION_TAG="V1" \
   vbz-flows:latest

@@ -13,4 +13,5 @@ docker run --rm \
   -e INPUT_DIR="silver/pedestrian_bicycle/sample" \
   -e INPUT_FILENAME_SUBSTR="pedestrian" \
   -e OUTPUT_DIR="gold/zurich_pedbike_flows/sample" \
+  -e VERSION_TAG="V+"\
   pedbike-flows:latest
