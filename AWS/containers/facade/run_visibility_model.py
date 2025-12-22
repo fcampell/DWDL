@@ -355,6 +355,10 @@ def main():
     if processing_crs:
         gdf = gdf.to_crs(processing_crs)
 
+    # Subset df to only rows we need
+    cols = ["objectid", "bezeichnung" ,"GWR_EGID" , "geometry"]
+    gdf = gdf[cols]
+    
     # --------------------------------------------------------
     # Compute polygon visibility per row, with progress logging
     # --------------------------------------------------------
