@@ -61,7 +61,7 @@ import os
 import math
 import logging
 import tempfile
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import boto3
 import numpy as np
@@ -429,14 +429,16 @@ def main():
         gdf
         .groupby(["msid", "richtung", "hour"], as_index=False)
         .agg(
-            anz_fahrzeuge=("anz_fahrzeuge", "mean"),  # typical hourly flow over all days
+            anz_fahrzeuge=("anz_fahrzeuge", "mean"),
             lon=("lon", "first"),
             lat=("lat", "first"),
-            msname=("msname", "first") if "msname" in gdf.columns else ("lon", "first"),
-            achse=("achse", "first") if "achse" in gdf.columns else ("lon", "first"),
+            msname=("msname", "first"),
+            zsname=("zsname", "first"),
+            achse=("achse", "first"),
         )
         .rename(columns={"anz_fahrzeuge": "flow_value"})
     )
+
 
     gdf_stations = gpd.GeoDataFrame(
         agg,
@@ -526,74 +528,108 @@ def main():
                 "bearing_seed",
                 "start_node",
                 "hour",
+                "zsname",
+                "achse",
             ]
         ].copy(),
         geometry=gdf_stations.geometry,
         crs="EPSG:4326",
     )
 
+
     logger.info("Final seeds to propagate: %d", len(gdf_seeds))
 
     # --------------------------------------------------------------
-    # 7+8. Propagate flows along OSM graph (edge×hour) WITHOUT OOM
-    #      Stream-aggregate into dictionaries keyed by (u,v,key,hour)
+    # 7+8. MASS-BALANCED FLOW PROPAGATION (REPLACEMENT)
     # --------------------------------------------------------------
-    sum_flow = defaultdict(float)   # (u, v, key, hour) -> total_flow
-    seed_count = defaultdict(int)   # (u, v, key, hour) -> contributing seed instances count
+    logger.info("Starting MASS-BALANCED flow propagation for %d seeds ...", len(gdf_seeds))
 
-    logger.info("Starting flow propagation for %d seeds ...", len(gdf_seeds))
+    sum_flow = defaultdict(float)        # (u, v, k, hour) -> flow
+    meta_zs = defaultdict(lambda: defaultdict(int))
+    meta_achse = defaultdict(lambda: defaultdict(int))
+
     for idx, seed in gdf_seeds.iterrows():
+
         if idx > 0 and idx % 50 == 0:
             logger.info("  Processed %d seeds ...", idx)
 
         seed_node = seed["start_node"]
-        start_flow = float(seed["flow_value"])
+        seed_flow = float(seed["flow_value"])
         seed_bearing = float(seed["bearing_seed"])
         hour = int(seed["hour"])
 
-        lengths = nx.single_source_dijkstra_path_length(
-            G,
-            seed_node,
-            cutoff=max_distance_m,
-            weight="length",
-        )
+        queue = deque()
+        queue.append((seed_node, 0.0, seed_flow))
+        visited = {}
 
-        # ensure we count each seed at most once per edge-hour key
-        seen_edgehour = set()
+        while queue:
+            node, dist, flow = queue.popleft()
 
-        for node_id, dist_m in lengths.items():
-            if dist_m == 0:
+            if dist > max_distance_m or flow < min_flow:
                 continue
 
-            flow_value = damp_flow(start_flow, dist_m, decay_factor)
-            if flow_value < min_flow:
+            if node in visited and visited[node] <= dist:
+                continue
+            visited[node] = dist
+
+            edges = list(G.out_edges(node, keys=True, data=True))
+            if not edges:
                 continue
 
-            for _, v2, k2, data in G.out_edges(node_id, keys=True, data=True):
-                edge_bearing = float(data.get("bearing", np.nan))
-                w = direction_weight(seed_bearing, edge_bearing, max_bearing_diff)
-                if w < min_edge_share:
-                    continue
+            candidates = []
+            for _, v, k, data in edges:
+                w = direction_weight(
+                    seed_bearing,
+                    float(data.get("bearing", np.nan)),
+                    max_bearing_diff
+                )
+                if w >= min_edge_share:
+                    candidates.append((v, k, data, w))
 
-                key4 = (node_id, v2, k2, hour)
-                sum_flow[key4] += flow_value * w
+            if not candidates:
+                continue
 
-                if key4 not in seen_edgehour:
-                    seed_count[key4] += 1
-                    seen_edgehour.add(key4)
+            w_sum = sum(w for *_, w in candidates)
+            if w_sum <= 0:
+                continue
 
-    logger.info("Flow propagation finished. Aggregated %d edge×hour keys.", len(sum_flow))
+            for v, k, data, w in candidates:
+                share = w / w_sum
+                edge_flow = flow * share
 
-    if not sum_flow:
-        logger.warning("No flows generated; outputs will contain zero flows.")
-        df_edge_flow = pd.DataFrame(columns=["u", "v", "key", "hour", "total_flow", "n_sources"])
-    else:
-        df_edge_flow = pd.DataFrame(
-            [(u, v, k, h, f, seed_count[(u, v, k, h)]) for (u, v, k, h), f in sum_flow.items()],
-            columns=["u", "v", "key", "hour", "total_flow", "n_sources"],
-        )
+                key4 = (node, v, k, hour)
+                sum_flow[key4] += edge_flow
 
-    logger.info("Aggregated flows for %d edge×hour combinations.", len(df_edge_flow))
+                meta_zs[key4][seed["zsname"]] += 1
+                meta_achse[key4][seed["achse"]] += 1
+
+                edge_len = float(data.get("length", 0.0))
+                new_dist = dist + edge_len
+                new_flow = damp_flow(edge_flow, edge_len, decay_factor)
+
+                queue.append((v, new_dist, new_flow))
+
+    logger.info("Propagation finished. Aggregated %d edge×hour keys.", len(sum_flow))
+
+    # --------------------------------------------------------------
+    # GLOBAL MASS BALANCE PER HOUR (HARD BRAKE)
+    # --------------------------------------------------------------
+    df_edge_flow = pd.DataFrame(
+        [(u, v, k, h, f) for (u, v, k, h), f in sum_flow.items()],
+        columns=["u", "v", "key", "hour", "total_flow"]
+    )
+
+    seed_totals = gdf_seeds.groupby("hour")["flow_value"].sum()
+
+    for h, total_seed_flow in seed_totals.items():
+        mask = df_edge_flow["hour"] == h
+        total_edge_flow = df_edge_flow.loc[mask, "total_flow"].sum()
+        if total_edge_flow > 0:
+            scale = total_seed_flow / total_edge_flow
+            df_edge_flow.loc[mask, "total_flow"] *= scale
+
+
+    logger.info("Done. Flow model stabilized (local + global mass balance).")
 
     # --------------------------------------------------------------
     # 9. Build edge GeoDataFrame and join flows

@@ -11,8 +11,8 @@ docker run --rm \
   -e LOCAL_BUCKET_ROOT=/data \
   -e INPUT_PREFIX="silver/motorized_traffic/sample" \
   -e INPUT_FILTER="motorized_traffic" \
-  -e OUTPUT_KEY="gold/motorized_traffic" \
-  traffic-flow:latest
+  -e OUTPUT_KEY="gold/motorized_traffic/sample" \
+  motorized-traffic-flows:new
 
 docker run --rm \
   -v "$(pwd)/local_bucket:/data" \
@@ -22,3 +22,12 @@ docker run --rm \
   -e OUTPUT_KEY="gold/motorized_traffic/2025_new" \
   -e VERSION_TAG="2025" \
   motorized-traffic-flow:latest
+
+docker run --rm \
+  -v "$(pwd)/local_bucket:/data" \
+  -e LOCAL_BUCKET_ROOT=/data \
+  -e INPUT_PREFIX="silver/motorized_traffic/2025" \
+  -e INPUT_FILTER="motorized_traffic" \
+  -e OUTPUT_KEY="gold/motorized_traffic/2025_new_model" \
+  -e VERSION_TAG="2025" \
+  motorized-traffic-flows:new
