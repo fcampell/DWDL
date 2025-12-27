@@ -312,7 +312,7 @@ def main():
 
     if "Tagtyp_Id" in reisende.columns and "Tagtyp_Id" in tagtyp.columns:
         reisende = reisende.merge(
-            tagtyp[["Tagtyp_Id", "Tagtypname", "Bemerkung"]],
+            tagtyp[["Tagtyp_Id", "Tagtypname"]],
             on="Tagtyp_Id",
             how="left",
         )
@@ -320,7 +320,13 @@ def main():
         logger.warning("Tagtyp_Id missing in either REISENDE or TAGTYP; skipping join.")
 
     # For now: keep all days (same as notebook, no weekday filter)
-    reisende_weekday = reisende.copy()
+    # Example: keep only weekdays
+    #reisende = reisende.merge(tagtyp[["Tagtyp_Id", "Tagtypname"]], on="Tagtyp_Id")
+
+    weekday_mask = reisende["Tagtypname"].str.contains("15-A1-24", case=False, na=False)
+    reisende_weekday = reisende[weekday_mask]
+
+    #reisende_weekday = reisende.copy()
 
     # -------------------------------
     # 4. Build flow dataset (segment + hour)
@@ -330,6 +336,7 @@ def main():
 
     # Only keep rows with valid hour
     flows = flows[flows["hour"] >= 0].copy()
+    
 
     # Aggregate: total Besetzung per segment + hour
     segment_hour = (
