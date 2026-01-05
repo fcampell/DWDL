@@ -3,6 +3,7 @@ __pycache__/
 *.py[codz]
 *$py.class
 /notebooks/cache
+.DS_Store
 
 # Environments
 .env
@@ -23,3 +24,4 @@ venv.bak/
 *.gpkg
 *.shp
 *.csv
+*.parquet
