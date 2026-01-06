@@ -15,13 +15,48 @@ ENV/
 env.bak/
 venv.bak/
 
-# data
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.claude/
+
+# Data files and large geospatial files
 /swissBUILDINGS3D
 /solarenergie-eignung
 /stadtkreise
 /verkehr
 *.gml
 *.gpkg
+*.gpkg-shm
+*.gpkg-wal
 *.shp
 *.csv
 *.parquet
+*.parquet-*
+
+# Local database and cache files
+/data/
+/cache/
+*.db
+*.sqlite
+
+# AWS and deployment
+.aws/
+AWS/containers/local_bucket/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# OS files
+Thumbs.db
+.DS_Store
+*.bak
+.~*
+
+# Logs
+*.log
+logs/
