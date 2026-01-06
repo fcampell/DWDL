@@ -20,13 +20,13 @@ This project was developed as a Master's thesis project by the **Dataholics** te
 
 ## Key Features
 
-✅ **City-Scale Visibility Analysis** - Estimates facade visibility across all buildings in Zürich
-✅ **Multi-Modal Mobility Modeling** - Integrates motorized traffic, pedestrians, cyclists, and public transport
-✅ **Temporal Granularity** - Provides hourly flow estimates and time-of-day insights
-✅ **Dual-Use Dashboards** - Separate views for marketing agencies (demand-side) and property owners (supply-side)
-✅ **Revenue Estimation** - Translates visibility metrics into indicative monetization potential
-✅ **Scalable Architecture** - AWS-based cloud infrastructure supporting continuous data ingestion
-✅ **Reproducible Pipeline** - Versioned models and data lineage for transparency
+-  **City-Scale Visibility Analysis** - Estimates facade visibility across all buildings in Zürich
+- **Multi-Modal Mobility Modeling** - Integrates motorized traffic, pedestrians, cyclists, and public transport
+- **Temporal Granularity** - Provides hourly flow estimates and time-of-day insights
+- **Dual-Use Dashboards** - Separate views for marketing agencies (demand-side) and property owners (supply-side)
+- **Revenue Estimation** - Translates visibility metrics into indicative monetization potential
+- **Scalable Architecture** - AWS-based cloud infrastructure supporting continuous data ingestion
+- **Reproducible Pipeline** - Versioned models and data lineage for transparency
 
 ---
 
@@ -270,16 +270,16 @@ Zürich OGD
 ## Key Findings & Limitations
 
 ### Strengths
-✅ Successfully demonstrates technical feasibility of city-scale visibility analysis
-✅ Clear end-to-end pipeline with consistent data lineage
-✅ Effective separation of concerns (modeling in lake, serving in warehouse)
-✅ Dual-use dashboards serving both demand and supply perspectives
+- Successfully demonstrates technical feasibility of city-scale visibility analysis
+- Clear end-to-end pipeline with consistent data lineage
+- Effective separation of concerns (modeling in lake, serving in warehouse)
+- Dual-use dashboards serving both demand and supply perspectives
 
 ### Limitations
-⚠️ **Pedestrian & Bicycle Data Sparsity** - Only 15 counting stations citywide; peripheral areas have high uncertainty
-⚠️ **Flow Propagation Assumptions** - Models rely on simplifying assumptions about movement behavior and decay with distance
-⚠️ **OpenStreetMap Dependency** - Results sensitive to network completeness and accuracy
-⚠️ **Pricing Assumptions** - Revenue estimates based on configurable CPM values, not empirical market data
+- **Pedestrian & Bicycle Data Sparsity** - Only 15 counting stations citywide; peripheral areas have high uncertainty
+- **Flow Propagation Assumptions** - Models rely on simplifying assumptions about movement behavior and decay with distance
+- **OpenStreetMap Dependency** - Results sensitive to network completeness and accuracy
+- **Pricing Assumptions** - Revenue estimates based on configurable CPM values, not empirical market data
 
 ### Future Work
 - **Probabilistic modeling** using Monte Carlo simulations to quantify uncertainty
